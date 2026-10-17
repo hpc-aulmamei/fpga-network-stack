@@ -87,7 +87,7 @@ void drop_optional_ip_header(	stream<ap_uint<4> >&	process2dropLengthFifo,
 					doh_state = SHIFT;
 				}
 			}
-			if (WIDTH == 256 || WIDTH == 512)
+			if (WIDTH >= 256)
 			{
 				//TODO this is a hack and only works if there are no IP options
 				if (length == 5)
@@ -229,7 +229,7 @@ void ipv4_drop_optional_ip_header(	stream<ap_uint<4> >&	process2dropLengthFifo,
 					doh_state = SHIFT;
 				}
 			}
-			if (WIDTH == 256 || WIDTH == 512)
+			if (WIDTH >= 256)
 			{
 				//TODO this is a hack and only works if there are no IP options
 				if (length == 5)
