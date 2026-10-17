@@ -245,14 +245,14 @@ struct ackMeta
     ap_uint<2> strm;
     ap_uint<1> lst;
     // Window slot (req offs) of the completed request; cum marks a completion
-    // that also completes every older request of the QP (bits 56-60)
-    ap_uint<4> offs;
+    // that also completes every older request of the QP (bits 56-61, 62)
+    ap_uint<6> offs;
     ap_uint<1> cum;
 
 	ackMeta() {}
 	ackMeta(ibOpCode op_code, ap_uint<16> qpn, ap_uint<1> host, ap_uint<4> dst, ap_uint<2> strm, ap_uint<1> lst)
 		: op_code(op_code), qpn(qpn), host(host), dst(dst), strm(strm),  lst(lst), offs(0), cum(0) {}
-	ackMeta(ibOpCode op_code, ap_uint<16> qpn, ap_uint<1> host, ap_uint<4> dst, ap_uint<2> strm, ap_uint<1> lst, ap_uint<4> offs)
+	ackMeta(ibOpCode op_code, ap_uint<16> qpn, ap_uint<1> host, ap_uint<4> dst, ap_uint<2> strm, ap_uint<1> lst, ap_uint<6> offs)
 		: op_code(op_code), qpn(qpn), host(host), dst(dst), strm(strm),  lst(lst), offs(offs), cum(1) {}
 };
 
@@ -337,12 +337,12 @@ struct retransEvent
 	ap_uint<32> length;
 	ap_uint<24>	psn;
     ap_uint<1>  lst;
-    ap_uint<4>  offs;
+    ap_uint<6>  offs;
 	bool		validPsn;  //TODO remove?
 	bool		isNak; //TODO remove?
 	retransEvent()
 		:op_code(RC_ACK), validPsn(false), isNak(false) {}
-	retransEvent(ibOpCode op, ap_uint<24> qp, ap_uint<64> laddr, ap_uint<64> raddr, ap_uint<32> len, ap_uint<24> psn, ap_uint<1> lst, ap_uint<4> offs)
+	retransEvent(ibOpCode op, ap_uint<24> qp, ap_uint<64> laddr, ap_uint<64> raddr, ap_uint<32> len, ap_uint<24> psn, ap_uint<1> lst, ap_uint<6> offs)
 		:op_code(op), qpn(qp), localAddr(laddr), remoteAddr(raddr),length(len), psn(psn), lst(lst), offs(offs), validPsn(true), isNak(false) {}
 };
 

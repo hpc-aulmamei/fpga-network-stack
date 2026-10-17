@@ -84,10 +84,10 @@ struct retransAddrLen
 	ap_uint<64> remoteAddr;
 	ap_uint<32> length;
     ap_uint<1>  lst;
-    ap_uint<4>  offs;
+    ap_uint<6>  offs;
     ap_uint<1>  host;
 	retransAddrLen() {}
-	retransAddrLen(ap_uint<64> laddr, ap_uint<64> raddr, ap_uint<32> len, ap_uint<1> lst, ap_uint<4> offs, ap_uint<1> host)
+	retransAddrLen(ap_uint<64> laddr, ap_uint<64> raddr, ap_uint<32> len, ap_uint<1> lst, ap_uint<6> offs, ap_uint<1> host)
 		:localAddr(laddr), remoteAddr(raddr), length(len), lst(lst), offs(offs), host(host) {}
 };
 
@@ -100,10 +100,10 @@ struct retransEntry
 	ap_uint<64> remoteAddr;
 	ap_uint<32> length;
     ap_uint<1>  lst;
-    ap_uint<4>  offs;
+    ap_uint<6>  offs;
     ap_uint<1>  host;
 	retransEntry() {}
-	retransEntry(ap_uint<16> qpn, ap_uint<24> psn, ibOpCode op, ap_uint<64> laddr, ap_uint<64> raddr, ap_uint<32> len, ap_uint<1> lst, ap_uint<4> offs, ap_uint<1> host)
+	retransEntry(ap_uint<16> qpn, ap_uint<24> psn, ibOpCode op, ap_uint<64> laddr, ap_uint<64> raddr, ap_uint<32> len, ap_uint<1> lst, ap_uint<6> offs, ap_uint<1> host)
 		:qpn(qpn), psn(psn), opCode(op), localAddr(laddr), remoteAddr(raddr), length(len), lst(lst), offs(offs), host(host) {}
 	retransEntry(retransMeta meta, retransAddrLen addrlen)
 		:qpn(meta.qpn), psn(meta.psn), opCode(meta.opCode), localAddr(addrlen.localAddr), remoteAddr(addrlen.remoteAddr), length(addrlen.length), lst(addrlen.lst), offs(addrlen.offs), host(addrlen.host) {}
@@ -147,7 +147,7 @@ struct retransMetaEntry
 	ap_uint<64> remoteAddr;
 	ap_uint<32> length;
     ap_uint<1>  lst;
-    ap_uint<4>  offs;
+    ap_uint<6>  offs;
     ap_uint<1>  host;
 	bool valid;
 	bool isTail;
