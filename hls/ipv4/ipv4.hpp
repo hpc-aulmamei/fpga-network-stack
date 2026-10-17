@@ -352,15 +352,30 @@ void compute_ipv4_checksum(	hls::stream<net_axis<512> >&	dataIn,
 							hls::stream<subSums<32> >&		subSumFiFoOut,
 							const bool						skipChecksum=false);
 
+void compute_ipv4_checksum(	hls::stream<net_axis<1024> >&	dataIn,
+							hls::stream<net_axis<1024> >&	dataOut,
+							hls::stream<subSums<64> >&		subSumFiFoOut,
+							const bool						skipChecksum=false);
+
 // SOME SOLUTION IS NEEDED, THIS IS TERRIBLE
 void mac_compute_ipv4_checksum(	hls::stream<net_axis<512> >&	dataIn,
 							hls::stream<net_axis<512> >&	dataOut,
 							hls::stream<subSums<32> >&		subSumFiFoOut,
 							const bool						skipChecksum=false);
 
+void mac_compute_ipv4_checksum(	hls::stream<net_axis<1024> >&	dataIn,
+							hls::stream<net_axis<1024> >&	dataOut,
+							hls::stream<subSums<64> >&		subSumFiFoOut,
+							const bool						skipChecksum=false);
+
 void ip_handler_compute_ipv4_checksum(	hls::stream<net_axis<512> >&	dataIn,
 							hls::stream<net_axis<512> >&	dataOut,
 							hls::stream<subSums<32> >&		subSumFiFoOut,
+							const bool						skipChecksum=false);
+
+void ip_handler_compute_ipv4_checksum(	hls::stream<net_axis<1024> >&	dataIn,
+							hls::stream<net_axis<1024> >&	dataOut,
+							hls::stream<subSums<64> >&		subSumFiFoOut,
 							const bool						skipChecksum=false);
 
 //A hack to Vitis working flow
