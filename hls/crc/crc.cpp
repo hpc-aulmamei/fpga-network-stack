@@ -107,76 +107,17 @@ void extract_icrc(	stream<net_axis<WIDTH> >&		input,
 		break;
 	case LAST:
         //std::cout << "[ NODE: " << INSTID << ", EXTRACT_CRC(), LAST STATE ]:  Data " << std::hex << currWord.data << ", Last " << currWord.last << std::dec << std::endl;
-		ap_uint<64> keep = ei_prevWord.keep; //this is required to make the case statement work for all widths
-
-		// Depending on keep, select data for crc-calculation and set some keep-bits to 0 accordingly. 
-		switch(keep)
+		// The ICRC is the last 4 valid bytes of the word (packets are a multiple
+		// of 4 bytes): find that group for any width and remove it.
+		for (int g = 0; g < WIDTH/32; g++)
 		{
-		case 0xF:
-			//This should not occur
-			crc = ei_prevWord.data(31, 0);
-			break;
-		case 0xFF:
-			crc = ei_prevWord.data(63, 32);
-			ei_prevWord.keep(7,4) = 0x0;
-			break;
-		case 0xFFF:
-			crc = ei_prevWord.data(95, 64);
-			ei_prevWord.keep(11,8) = 0x0;
-			break;
-		case 0xFFFF:
-			crc = ei_prevWord.data(127, 96);
-			ei_prevWord.keep(15,12) = 0x0;
-			break;
-		case 0xFFFFF:
-			crc = ei_prevWord.data(159, 128);
-			ei_prevWord.keep(19,16) = 0x0;
-			break;
-		case 0xFFFFFF:
-			crc = ei_prevWord.data(191, 160);
-			ei_prevWord.keep(23,20) = 0x0;
-			break;
-		case 0xFFFFFFF:
-			crc = ei_prevWord.data(223, 192);
-			ei_prevWord.keep(27,24) = 0x0;
-			break;
-		case 0xFFFFFFFF:
-			crc = ei_prevWord.data(255, 224);
-			ei_prevWord.keep(31,28) = 0x0;
-			break;
-		case 0xFFFFFFFFF:
-			crc = ei_prevWord.data(287, 256);
-			ei_prevWord.keep(35,32) = 0x0;
-			break;
-		case 0xFFFFFFFFFF:
-			crc = ei_prevWord.data(319, 288);
-			ei_prevWord.keep(39,36) = 0x0;
-			break;
-		case 0xFFFFFFFFFFF:
-			crc = ei_prevWord.data(351, 320);
-			ei_prevWord.keep(43,40) = 0x0;
-			break;
-		case 0xFFFFFFFFFFFF:
-			crc = ei_prevWord.data(383, 352);
-			ei_prevWord.keep(47,44) = 0x0;
-			break;
-		case 0xFFFFFFFFFFFFF:
-			crc = ei_prevWord.data(415, 384);
-			ei_prevWord.keep(51,48) = 0x0;
-			break;
-		case 0xFFFFFFFFFFFFFF:
-			crc = ei_prevWord.data(447, 416);
-			ei_prevWord.keep(55,52) = 0x0;
-			break;
-		case 0xFFFFFFFFFFFFFFF:
-			crc = ei_prevWord.data(479, 448);
-			ei_prevWord.keep(59,56) = 0x0;
-			break;
-		case 0xFFFFFFFFFFFFFFFF:
-			crc = ei_prevWord.data(511, 480);
-			ei_prevWord.keep(63,60) = 0x0;
-			break;
-		} //switch
+			#pragma HLS unroll
+			if (ei_prevWord.keep[g*4+3] && (g == WIDTH/32-1 || !ei_prevWord.keep[g*4+4]))
+			{
+				crc = ei_prevWord.data(g*32+31, g*32);
+				ei_prevWord.keep(g*4+3, g*4) = 0;
+			}
+		}
 
 		// Send the read word to output, forward CRC-value to FIFO
 		output.write(ei_prevWord);
