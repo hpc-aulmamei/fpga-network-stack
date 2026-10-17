@@ -101,9 +101,11 @@ void generate_ipv4( stream<ipv4Meta>&		txEng_ipMetaDataFifoIn,
 			header.setSrcAddr(local_ipv4_address);
 			header.setProtocol(protocol);
 
-			// Set ECN and flags accordingly 
-			header.setECN(2);
-			header.setFlags(2);
+			// Set ECN and flags accordingly (as ipv4_generate_ipv4, the HLS
+			// build: ECT(0), TOS 0x02, and don't fragment; both setters take
+			// one bit, so the former 2 became 0)
+			header.setECN(1);
+			header.setFlags(1);
 
 			if (IPV4_HEADER_SIZE >= WIDTH)
 			{

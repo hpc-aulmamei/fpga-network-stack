@@ -109,14 +109,21 @@ void extract_icrc(	stream<net_axis<WIDTH> >&		input,
         //std::cout << "[ NODE: " << INSTID << ", EXTRACT_CRC(), LAST STATE ]:  Data " << std::hex << currWord.data << ", Last " << currWord.last << std::dec << std::endl;
 		// The ICRC is the last 4 valid bytes of the word (packets are a multiple
 		// of 4 bytes): find that group for any width and remove it.
-		for (int g = 0; g < WIDTH/32; g++)
+		// (decide on the keep as it came in and apply the result once, so that
+		// the groups do not chain)
 		{
-			#pragma HLS unroll
-			if (ei_prevWord.keep[g*4+3] && (g == WIDTH/32-1 || !ei_prevWord.keep[g*4+4]))
+			const ap_uint<WIDTH/8> keep_in = ei_prevWord.keep;
+			ap_uint<WIDTH/8> clear;
+			ap_uint<32> found = 0;
+			for (int g = 0; g < WIDTH/32; g++)
 			{
-				crc = ei_prevWord.data(g*32+31, g*32);
-				ei_prevWord.keep(g*4+3, g*4) = 0;
+				#pragma HLS unroll
+				const bool hit = keep_in[g*4+3] && (g == WIDTH/32-1 || !keep_in[g*4+4]);
+				clear(g*4+3, g*4) = hit ? 0xF : 0x0;
+				found |= hit ? (ap_uint<32>) ei_prevWord.data(g*32+31, g*32) : (ap_uint<32>) 0;
 			}
+			crc = found;
+			ei_prevWord.keep = keep_in & ~clear;
 		}
 
 		// Send the read word to output, forward CRC-value to FIFO
