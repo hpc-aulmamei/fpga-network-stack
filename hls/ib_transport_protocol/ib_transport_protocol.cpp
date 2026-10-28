@@ -252,7 +252,7 @@ void rx_process_exh(
 //TODO check if RC_ACK is a NAK
 //TODO validate response is consistent with request
 //TODO actually any response in Unack region is valid, not just the next one.
-template <int INSTID = 0>
+template <int WIDTH, int INSTID = 0>
 void rx_ibh_fsm(
 #ifdef DBG_IBV
     stream<psnPkg>&	m_axis_dbg,
@@ -439,7 +439,14 @@ void rx_ibh_fsm(
 				// Issue NAK TODO NAK has to be in sequence
 				if (meta.op_code != RC_ACK)
 				{
-					ibhDropFifo.write(true);
+					// rx_process_exh passes no data on for a READ request when the
+					// RETH ends in the first word (WIDTH > RETH_SIZE), as for ACKs:
+					// a drop entry would wait for data that never comes and stall
+					// the RX path (an in-order READ request writes none either)
+					if (meta.op_code != RC_RDMA_READ_REQUEST || WIDTH <= RETH_SIZE)
+					{
+						ibhDropFifo.write(true);
+					}
 					// Do not generate further ACK/NAKs until we received a valid pkg
 					if (qpState.retryCounter == 0x7)
 					{
@@ -2549,7 +2556,7 @@ void ib_transport_protocol(
 		rx_exh2dropFifo
 	);
 
-	rx_ibh_fsm<INSTID>(	
+	rx_ibh_fsm<WIDTH, INSTID>(	
     #ifdef DBG_IBV
 		m_axis_dbg_1,
 #endif 
