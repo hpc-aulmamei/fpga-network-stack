@@ -352,6 +352,13 @@ void rx_ibh_fsm(
                         m_axis_rx_ack_meta.write(ackMeta(meta.op_code != RC_ACK, meta.dest_qp));
                     }*/
 				}
+				else if (isResponse)
+				{
+					// A NAK carries the PSN the responder expects, so it acknowledges
+					// every request before it
+					std::cout << std::hex <<"[RX IBH FSM " << INSTID << "]: retrans update before NAK, psn " << meta.psn << std::endl;
+					rx2retrans_upd.write(retransUpdate(meta.dest_qp, meta.psn - 1, RC_ACK));
+				}
 				// Check if no oustanding requests -> stop timer
 				if (isResponse && meta.op_code != RC_RDMA_READ_RESP_MIDDLE)
 				{
@@ -538,7 +545,8 @@ void rx_exh_fsm(
 				readReqTable_upd_req.write(rxReadReqUpdate(meta.dest_qp));
 			}*/
 #endif
-			if (meta.op_code == RC_RDMA_READ_RESP_ONLY || meta.op_code == RC_RDMA_READ_RESP_FIRST || meta.op_code == RC_ACK)
+			// RC_ACK completions come from the retransmitter, one per released request
+			if (meta.op_code == RC_RDMA_READ_RESP_ONLY || meta.op_code == RC_RDMA_READ_RESP_FIRST)
 			{
 				consumeReadInit = true;
 				//rx_readReqAddr_pop_req.write(mqPopReq(meta.dest_qp));
@@ -751,9 +759,11 @@ void rx_exh_fsm(
 			// [BTH][AETH]
 			AckExHeader<WIDTH> ackHeader = exHeader.getAckHeader();
 
+#ifndef RETRANS_EN
             m_axis_rx_ack_meta.write(ackMeta(meta.op_code, meta.dest_qp(19,0), readReqInit.host, 
                     readReqInit.host ? readReqInit.laddr(51,48) : 0, readReqInit.host ? readReqInit.laddr(53,52) : 0,
                     readReqInit.lst));
+#endif
 
 			std::cout << "[RX EXH FSM " << INSTID << "]: syndrome: " << std::hex << ackHeader.getSyndrome() << std::endl;
 #ifdef RETRANS_EN
@@ -2470,6 +2480,8 @@ void ib_transport_protocol(
 	static stream<retransAddrLen> tx2retrans_insertAddrLen("tx2retrans_insertAddrLen");
 	static stream<retransEntry>	tx2retrans_insertRequest("tx2retrans_insertRequest");
 	static stream<retransEvent> retransmitter2exh_eventFifo("retransmitter2exh_eventFifo");
+	static stream<ackMeta> rx_exhAckMetaFifo("rx_exhAckMetaFifo");
+	static stream<ackMeta> retrans2ack_meta("retrans2ack_meta");
 	#pragma HLS STREAM depth=2 variable=rxClearTimer_req
 	#pragma HLS STREAM depth=2 variable=txSetTimer_req
 	#pragma HLS STREAM depth=2 variable=rx2retrans_upd
@@ -2480,6 +2492,8 @@ void ib_transport_protocol(
 	#pragma HLS STREAM depth=8 variable=tx2retrans_insertAddrLen
 	#pragma HLS STREAM depth=2 variable=tx2retrans_insertRequest
 	#pragma HLS STREAM depth=8 variable=retransmitter2exh_eventFifo
+	#pragma HLS STREAM depth=4 variable=rx_exhAckMetaFifo
+	#pragma HLS STREAM depth=4 variable=retrans2ack_meta
 #endif
 
 	//TODO this is a hack
@@ -2579,7 +2593,11 @@ void ib_transport_protocol(
 		//rx_ibhDrop2exhFifo,
 		m_axis_mem_write_cmd,
 		rx_readRequestFifo,
+#ifdef RETRANS_EN
+		rx_exhAckMetaFifo,
+#else
 		m_axis_rx_ack_meta,
+#endif
 		rxExh2msnTable_upd_req,
 		//rx_readReqAddr_pop_req,
 		rx_exhEventMetaFifo,
@@ -2770,8 +2788,11 @@ void ib_transport_protocol(
 		rx2retrans_req,
 		timer2retrans_req,
 		tx2retrans_insertRequest,
-		retransmitter2exh_eventFifo
+		retransmitter2exh_eventFifo,
+		retrans2ack_meta
 	);
+
+	stream_merger<ackMeta>(rx_exhAckMetaFifo, retrans2ack_meta, m_axis_rx_ack_meta);
 #endif
 
 }
