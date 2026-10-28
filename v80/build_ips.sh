@@ -32,5 +32,10 @@ targets=""
 for ip in rocev2 ip_handler mac_ip_encode arp_server_subnet icmp_server; do
     targets="$targets services.$ip"
 done
+# HLS projects from an earlier run: export_design does not clear the solution
+# directory, so an IP would mix old and new RTL files
+for ip in $targets; do
+    rm -rf "$build/cmake/hls/${ip#services.}/${ip#services.}_prj"
+done
 make -C "$build/cmake" -j"$jobs" $targets
 ls "$IPREPO_DIR"

@@ -3,8 +3,8 @@
 # rocev2 csim (rocev2/test_rocev2_pair.cpp) with DATA_WIDTH = BYTES.
 W=${1:-128}; shift
 SCEN=${*:-clean sizes loss ack-loss daq window32}
-H=/scratch/users/aulmamei/v80/arh-coyote/hw/services/network/hls
-B=/scratch/users/aulmamei/v80/hlsbuild/pair_w$W
+H=$(cd "$(dirname "$0")/.." && pwd)
+B=${BUILD_DIR:-/tmp/rocev2_pair_$USER}_w$W
 INC=${HLS_INCLUDE:-/nfs/amd/Vitis/2024.2/include}
 mkdir -p $B
 for f in $H/rocev2/rocev2_config.hpp.in $H/ipv4/ipv4_config.hpp.in $H/ipv6/ipv6_config.hpp.in $H/udp/udp_config.hpp.in; do
