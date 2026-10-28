@@ -244,10 +244,16 @@ struct ackMeta
     ap_uint<4> dst;
     ap_uint<2> strm;
     ap_uint<1> lst;
+    // Window slot (req offs) of the completed request; cum marks a completion
+    // that also completes every older request of the QP (bits 56-60)
+    ap_uint<4> offs;
+    ap_uint<1> cum;
 
 	ackMeta() {}
 	ackMeta(ibOpCode op_code, ap_uint<16> qpn, ap_uint<1> host, ap_uint<4> dst, ap_uint<2> strm, ap_uint<1> lst)
-		: op_code(op_code), qpn(qpn), host(host), dst(dst), strm(strm),  lst(lst) {}
+		: op_code(op_code), qpn(qpn), host(host), dst(dst), strm(strm),  lst(lst), offs(0), cum(0) {}
+	ackMeta(ibOpCode op_code, ap_uint<16> qpn, ap_uint<1> host, ap_uint<4> dst, ap_uint<2> strm, ap_uint<1> lst, ap_uint<4> offs)
+		: op_code(op_code), qpn(qpn), host(host), dst(dst), strm(strm),  lst(lst), offs(offs), cum(1) {}
 };
 
 /* Event */

@@ -423,8 +423,10 @@ void process_retransmissions(
 
 			if (meta.valid && meta.opCode != RC_RDMA_READ_REQUEST && psn_before(meta.psn, releaseBefore))
 			{
+				// The completion names the request's window slot, so rdma_flow can
+				// free every slot up to it even if an earlier completion went missing
 				retrans2ack_meta.write(ackMeta(RC_ACK, update.qpn, meta.host,
-					meta.host ? meta.localAddr(51,48) : 0, meta.host ? meta.localAddr(53,52) : 0, meta.lst));
+					meta.host ? meta.localAddr(51,48) : 0, meta.host ? meta.localAddr(53,52) : 0, meta.lst, meta.offs));
 				std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_1 ack update, psn " << meta.psn << std::endl;
 
 				// Move index

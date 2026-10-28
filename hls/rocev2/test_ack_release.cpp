@@ -5,12 +5,15 @@
  * packets. Node 0 posts RDMA WRITE_ONLY requests and keeps at most 16 of them
  * outstanding per QP, counted the way rdma_flow counts them: one window slot
  * per request, freed by one entry on m_axis_rx_ack_meta. The test checks that
- * every request is completed exactly once whatever the link drops, and that
- * node 1 wrote every request to memory exactly once.
+ * every request is completed exactly once whatever the link drops, that each
+ * completion names its request's window slot (req offs) and is marked
+ * cumulative, and that node 1 wrote every request to memory exactly once.
  *
  * Every scenario runs in its own process because the transport keeps its
  * state in function statics:
- *     test_ack_release <clean|ack-loss|ack-burst|coalesce|data-loss|mixed|two-qp>
+ *     test_ack_release <clean|ack-loss|ack-burst|coalesce|data-loss|mixed|two-qp|start-loss|stream>
+ * start-loss and stream use 4 KiB requests and space the ACKs reaching node 0
+ * by 85 cycles, as ack_gap_enforcer does on hardware.
  * A drop pattern that repeats with the retransmission round can lose the same
  * packet on every retry; data-loss therefore drops at random.
  */
@@ -30,9 +33,10 @@ using namespace hls;
 
 namespace {
 
-const int TOTAL_REQUESTS = 256;
+int TOTAL_REQUESTS = 256;
 const int WINDOW = 16;                 // RDMA_N_WR_OUTSTANDING in rdma_flow
-const uint32_t REQUEST_BYTES = 1024;
+uint32_t REQUEST_BYTES = 1024;
+int ACK_GAP = 0;                       // min cycles between ACKs sent to node 0
 const uint64_t REMOTE_BASE = 0x100000;
 const uint64_t LOCAL_BASE = 0x200000;
 const long STALL_CYCLES = 400000;      // well past the transport timer back-off
@@ -96,14 +100,19 @@ struct Link {
     long acks = 0, requests = 0, dropped_acks = 0, dropped_requests = 0;
     std::map<int, long> opcodes;
 
+    long gap = 0, now = 0, last_ack = -1000000;
+
     void step(Node& from, Node& to, const DropPolicy& policy) {
+        ++now;
         if (!busy) {
             if (from.tx_meta.empty() || from.tx_data.empty()) return;
+            if (gap && now - last_ack < gap) return;
             ipUdpMeta meta = from.tx_meta.read();
             net_axis<DATA_WIDTH> word = from.tx_data.read();
             int opcode = (int)word.data(7, 0);
             opcodes[opcode]++;
             if (opcode == RC_ACK) {
+                last_ack = now;
                 dropping = policy.dropAck(acks++);
                 dropped_acks += dropping;
             } else {
@@ -155,6 +164,11 @@ bool scenarioFor(const std::string& name, DropPolicy& p, int& qps) {
     if (name == "coalesce") { p.ack_keep_every = 8; return true; }
     if (name == "data-loss") { p.data_percent = 10; return true; }
     if (name == "mixed") { p.ack_every = 4; p.data_every = 13; return true; }
+    if (name == "start-loss") {   // the peer drops its first ACKs (unresolved ARP)
+        p.ack_burst_from = 0; p.ack_burst_len = 6;
+        TOTAL_REQUESTS = 2000; REQUEST_BYTES = 4096; ACK_GAP = 85; return true;
+    }
+    if (name == "stream") { p.ack_every = 997; TOTAL_REQUESTS = 20000; REQUEST_BYTES = 4096; ACK_GAP = 85; return true; }
     if (name == "two-qp") { qps = 2; p.ack_every = 4; p.data_percent = 5; return true; }
     return false;
 }
@@ -200,10 +214,11 @@ int main(int argc, char* argv[]) {
         n1.conn.write(ifConnReq(remote_qp[q], local_qp[q], ip0, 5000));
     }
 
+    down.gap = ACK_GAP;
     for (int i = 0; i < 10; ++i) { step<0>(n0); step<1>(n1); }
 
     long posted[2] = {0, 0}, completed[2] = {0, 0};
-    long cycle = 0, last_progress = 0, early_acks = 0, foreign_acks = 0, extra_acks = 0;
+    long cycle = 0, last_progress = 0, early_acks = 0, foreign_acks = 0, extra_acks = 0, bad_slots = 0;
     int next_qp = 0;
     bool stalled = false;
     auto all_done = [&]() {
@@ -216,7 +231,7 @@ int main(int argc, char* argv[]) {
         for (int k = 0; k < qps; ++k) {
             int q = (next_qp + k) % qps;
             if (posted[q] < TOTAL_REQUESTS && posted[q] - completed[q] < WINDOW) {
-                n0.sq.write(txMeta(RC_RDMA_WRITE_ONLY, local_qp[q], 0, 1, 0,
+                n0.sq.write(txMeta(RC_RDMA_WRITE_ONLY, local_qp[q], 0, 1, posted[q] % WINDOW,
                                    LOCAL_BASE + posted[q] * REQUEST_BYTES,
                                    remoteAddr(q, posted[q]), REQUEST_BYTES, 0));
                 ++posted[q];
@@ -238,7 +253,11 @@ int main(int argc, char* argv[]) {
             for (int k = 0; k < qps; ++k) if (a.qpn == local_qp[k]) q = k;
             if (q < 0) { ++foreign_acks; continue; }
             if (completed[q] == posted[q]) ++early_acks;   // frees a slot nobody holds
-            else ++completed[q];
+            else {
+                // completions come in request order and name the request's slot
+                if (!a.cum || a.offs != completed[q] % WINDOW) ++bad_slots;
+                ++completed[q];
+            }
             last_progress = cycle;
         }
         while (!n1.ack.empty()) { n1.ack.read(); ++foreign_acks; }
@@ -275,6 +294,7 @@ int main(int argc, char* argv[]) {
               << ", requests dropped " << up.dropped_requests << "/" << up.requests
               << ", retransmissions " << n0.retrans.to_uint()
               << "; extra completions " << early_acks + extra_acks
+              << ", wrong slots " << bad_slots
               << ", writes missing " << missing << ", duplicated " << duplicated << '\n';
 
     bool ok = true;
@@ -283,6 +303,7 @@ int main(int argc, char* argv[]) {
     if (!all_done()) fail("not every request completed");
     if (early_acks || extra_acks) fail("more completions than requests, rdma_flow would free a slot it does not hold");
     if (foreign_acks) fail("completion for the wrong QP or node");
+    if (bad_slots) fail("a completion does not name its request's window slot or is not cumulative");
     if (missing) fail("node 1 never wrote some requests");
     if (duplicated) fail("node 1 wrote some requests twice");
     std::cout << (ok ? "PASS " : "FAIL ") << scenario << '\n';
