@@ -411,6 +411,10 @@ public:
 	{
 		header[71] = bit;
 	}
+	void setMigReq(bool bit)
+	{
+	    header[14] = bit;
+    }
 };
 
 struct ibhMeta

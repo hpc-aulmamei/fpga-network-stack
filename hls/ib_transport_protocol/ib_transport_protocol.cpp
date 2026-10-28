@@ -1429,7 +1429,7 @@ void generate_ibh(
 			dstQpIn.read(dstQp);
 			meta.partition_key = 0xFFFF; //TODO this is hard-coded, where does it come from??
 			header.clear();
-
+			header.setMigReq(true);
 			header.setOpCode(meta.op_code);
 			header.setPartitionKey(meta.partition_key);
 			//PSN only valid for READ_RSP, otherwise we get it in state GET_PSN
