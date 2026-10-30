@@ -516,6 +516,7 @@ void rx_exh_fsm(
 	stream<rxMsnReq>& rxExh2msnTable_upd_req,
 	//stream<mqPopReq>& rx_readReqAddr_pop_req,
 	stream<ackEvent>& rx_exhEventMetaFifo,
+	stream<ap_uint<1> >& rx_respOrderFifo,
 	stream<pkgSplit>& rx_pkgSplitTypeFifo,
 	stream<pkgShift>& rx_pkgShiftTypeFifo
 ) {
@@ -599,6 +600,7 @@ void rx_exh_fsm(
 			rxExh2msnTable_upd_req.write(rxMsnReq(meta.dest_qp, dmaMeta.msn+1));
 			// Trigger ACK
 			rx_exhEventMetaFifo.write(ackEvent(meta.dest_qp, meta.psn, false));
+			rx_respOrderFifo.write(0);
 			rx_pkgSplitTypeFifo.write(pkgSplit(meta.op_code));
 			rx_pkgShiftTypeFifo.write(pkgShift(SHIFT_NONE, meta.dest_qp));
 
@@ -617,6 +619,7 @@ void rx_exh_fsm(
 			rxExh2msnTable_upd_req.write(rxMsnReq(meta.dest_qp, dmaMeta.msn+1));
 			// Trigger ACK
 			rx_exhEventMetaFifo.write(ackEvent(meta.dest_qp, meta.psn, false));
+			rx_respOrderFifo.write(0);
 			rx_pkgSplitTypeFifo.write(pkgSplit(meta.op_code));
 			rx_pkgShiftTypeFifo.write(pkgShift(SHIFT_NONE, meta.dest_qp));
 
@@ -652,6 +655,7 @@ void rx_exh_fsm(
 				rxExh2msnTable_upd_req.write(rxMsnReq(meta.dest_qp, dmaMeta.msn+1, rdmaHeader.getVirtualAddress()+payLoadLength, remainingLength, 1));
 				// Trigger ACK
 				rx_exhEventMetaFifo.write(ackEvent(meta.dest_qp, meta.psn, false));
+			rx_respOrderFifo.write(0);
 				rx_pkgSplitTypeFifo.write(pkgSplit(meta.op_code));
 				rx_pkgShiftTypeFifo.write(pkgShift(SHIFT_RETH, meta.dest_qp));
 				pe_fsmState = META;
@@ -680,6 +684,7 @@ void rx_exh_fsm(
 			rxExh2msnTable_upd_req.write(rxMsnReq(meta.dest_qp, dmaMeta.msn+1, dmaMeta.vaddr+payLoadLength, remainingLength, 1));
 			// Trigger ACK
 			rx_exhEventMetaFifo.write(ackEvent(meta.dest_qp, meta.psn, false));
+			rx_respOrderFifo.write(0);
 			rx_pkgSplitTypeFifo.write(pkgSplit(meta.op_code));
 			rx_pkgShiftTypeFifo.write(pkgShift(SHIFT_NONE, meta.dest_qp));
 			pe_fsmState = META;
@@ -692,6 +697,7 @@ void rx_exh_fsm(
 			if (rdmaHeader.getLength() != 0)
 			{
 				readRequestFifo.write(readRequest(meta.dest_qp, rdmaHeader.getVirtualAddress(), rdmaHeader.getLength(), meta.psn));
+				rx_respOrderFifo.write(1);
 				rxExh2msnTable_upd_req.write(rxMsnReq(meta.dest_qp, dmaMeta.msn+1));
 			}
 			pe_fsmState = META;
@@ -1130,7 +1136,10 @@ void local_req_handler(
 		} 
 
 	}
-	else if (!s_axis_sq_meta.empty())
+	// A new request only when its retransmitter entry fits: the retransmitter
+	// takes no inserts while it replays a QP, and blocking here would stop
+	// the replay it waits for
+	else if (!s_axis_sq_meta.empty() && !tx2retrans_insertAddrLen.full())
 #else
 
 	if (!s_axis_sq_meta.empty())
@@ -1166,16 +1175,34 @@ template <int WIDTH, int INSTID = 0>
 void mem_cmd_merger(
 	stream<memCmdInternal>& remoteReadRequests,
 	stream<memCmdInternal>& localReadRequests,
+	stream<ap_uint<1> >& orderFifo,
 	stream<memCmd>& out,
 	stream<pkgInfo>& pkgInfoFifo
 ) {
 #pragma HLS inline off
 #pragma HLS pipeline II=1
 
+	// The payload is fetched in the order meta_merger puts the packets on the
+	// wire (orderFifo: 0 = READ response, 1 = local request), not by priority:
+	// tx_pkg_arbiter sorts the payload into one FIFO per packet type and
+	// append_payload drains them in packet order, so a different order would
+	// fill one FIFO while append_payload waits on another (deadlock with
+	// outgoing WRITEs and READ responses at the same time).
+	static bool orderValid = false;
+	static ap_uint<1> order;
+	bool ov = orderValid;
+	ap_uint<1> o = order;
 	memCmdInternal cmd;
 
-	if (!remoteReadRequests.empty())
+	if (!ov && !orderFifo.empty())
 	{
+		orderFifo.read(o);
+		ov = true;
+	}
+
+	if (ov && o == 0 && !remoteReadRequests.empty())
+	{
+		ov = false;
         std::cout << "[MEM CMD MERGER " << INSTID << "]: reading remote request" << std::endl;
 		remoteReadRequests.read(cmd);
 
@@ -1195,8 +1222,9 @@ void mem_cmd_merger(
 			pkgInfoFifo.write(pkgInfo(AETH, ((cmd.len+(WIDTH/8)-1)/(WIDTH/8))));
 		}
 	}
-	else if (!localReadRequests.empty())
+	else if (ov && o == 1 && !localReadRequests.empty())
 	{
+		ov = false;
 		localReadRequests.read(cmd);
 
 		std::cout << "[MEM CMD MERGER " << INSTID << "]: reading local request, opcode - " << std::hex << cmd.op_code 
@@ -1230,6 +1258,8 @@ void mem_cmd_merger(
 		}
 	}
 
+	orderValid = ov;
+	order = o;
 }
 
 /**
@@ -1336,44 +1366,81 @@ void tx_pkg_arbiter(
 /**
  * TX meta merger
  * 
- * rx_ackEventFifo RC_ACK from ibh and exh
- * rx_readEvenFifo READ events from RX side
- * tx_appMetaFifo, retransmission events, WRITEs and READ_REQ only
+ * rx_ibhEventFifo  NAKs and ACKs of duplicates from ibh
+ * rx_exhEventFifo  RC_ACK of valid requests from exh
+ * rx_respOrderFifo the order of those ACKs and the READ requests (0 = ACK,
+ *                  1 = READ): a responder answers in PSN order, else the
+ *                  requester takes an ACK for a WRITE behind an unanswered READ
+ *                  and never completes that WRITE
+ * rx_readEvenFifo  READ response packets from RX side
+ * tx_appMetaFifo   retransmission events, WRITEs and READ_REQ only
+ * tx_memCmdOrderFifo  for mem_cmd_merger: the packets with payload in this
+ *                  order, 0 = READ response, 1 = local request
  */
 template <int INSTID = 0>
 void meta_merger(	
-	stream<ackEvent>&	rx_ackEventFifo,
+	stream<ackEvent>&	rx_ibhEventFifo,
+	stream<ackEvent>&	rx_exhEventFifo,
+	stream<ap_uint<1> >&	rx_respOrderFifo,
 	stream<event>&		rx_readEvenFifo,
 	stream<event>&		tx_appMetaFifo,
 	//stream<event>&		timer2exhFifo,
 	stream<ap_uint<16> >&	tx_connTable_req,
 	stream<ibhMeta>&	tx_ibhMetaFifo,
-	stream<event>&		tx_exhMetaFifo
+	stream<event>&		tx_exhMetaFifo,
+	stream<ap_uint<1> >&	tx_memCmdOrderFifo
 ) {
 #pragma HLS inline off
 #pragma HLS pipeline II=1
 
+	static bool respValid = false;
+	static ap_uint<1> resp;
+	bool rv = respValid;
+	ap_uint<1> r = resp;
 	ackEvent aev;
 	event ev;
 	ap_uint<16> key = 0; //TODO hack
+	bool ack = false;
 
-	if (!rx_ackEventFifo.empty())
+	if (!rv && !rx_respOrderFifo.empty())
 	{
-		rx_ackEventFifo.read(aev);
+		rx_respOrderFifo.read(r);
+		rv = true;
+	}
 
+	if (!rx_ibhEventFifo.empty())
+	{
+		rx_ibhEventFifo.read(aev);
+		ack = true;
+	}
+	else if (rv && r == 0 && !rx_exhEventFifo.empty())
+	{
+		rx_exhEventFifo.read(aev);
+		ack = true;
+		rv = false;
+	}
+
+	if (ack)
+	{
 		tx_connTable_req.write(aev.qpn(15, 0));
 		// PSN used for read response
 		tx_ibhMetaFifo.write(ibhMeta(RC_ACK, key, aev.qpn, aev.psn, aev.validPsn));
 		tx_exhMetaFifo.write(event(aev));
 		std::cout << "[META MERGER " << INSTID << "]: reading from ack event with qpn " << aev.qpn << ", psn " << aev.psn << std::endl;
 	}
-	else if (!rx_readEvenFifo.empty())
+	else if (rv && r == 1 && !rx_readEvenFifo.empty())
 	{
 		rx_readEvenFifo.read(ev);
+		// the READ is answered with its last response packet
+		if (ev.op_code == RC_RDMA_READ_RESP_ONLY || ev.op_code == RC_RDMA_READ_RESP_LAST)
+		{
+			rv = false;
+		}
 		tx_connTable_req.write(ev.qpn(15, 0));
 		// PSN used for read response
 		tx_ibhMetaFifo.write(ibhMeta(ev.op_code, key, ev.qpn, ev.psn, ev.validPsn));
 		tx_exhMetaFifo.write(ev);
+		tx_memCmdOrderFifo.write(0);
 		std::cout << "[META MERGER " << INSTID << "]: reading from read event with qpn " << ev.qpn << ", psn " << ev.psn << std::endl;
 	}
 	else if (!tx_appMetaFifo.empty()) //TODO rename
@@ -1396,6 +1463,10 @@ void meta_merger(
 			tx_ibhMetaFifo.write(ibhMeta(ev.op_code, key, ev.qpn, numPkg));
 		}
 		tx_exhMetaFifo.write(ev);
+		if (ev.op_code != RC_RDMA_READ_REQUEST)
+		{
+			tx_memCmdOrderFifo.write(1);
+		}
 		std::cout << "[META MERGER " << INSTID << "]: reading from app event with qpn " << ev.qpn << ", psn " << ev.psn << std::endl;
 	}
 	/*else if (!timer2exhFifo.empty())
@@ -1407,6 +1478,9 @@ void meta_merger(
 		tx_ibhMetaFifo.write(ibhMeta(ev.op_code, key, ev.qpn, ev.psn, ev.validPsn));
 		tx_exhMetaFifo.write(ev);
 	}*/
+
+	respValid = rv;
+	resp = r;
 }
 
 /**
@@ -2284,7 +2358,7 @@ void ib_transport_protocol(
 	static stream<ackEvent>  rx_exhEventMetaFifo("rx_exhEventMetaFifo");
 	static stream<memCmdInternal> rx_remoteMemCmd("rx_remoteMemCmd");
 	#pragma HLS STREAM depth=2 variable=rx_ibhEventFifo
-	#pragma HLS STREAM depth=2 variable=rx_exhEventMetaFifo
+	#pragma HLS STREAM depth=32 variable=rx_exhEventMetaFifo
 	#pragma HLS STREAM depth=512 variable=rx_remoteMemCmd
 #if defined( __VITIS_HLS__)
 	#pragma HLS aggregate  variable=rx_ibhEventFifo compact=bit
@@ -2421,19 +2495,19 @@ void ib_transport_protocol(
 	static stream<ap_uint<16> > exh_lengthFifo("exh_lengthFifo");
 	static stream<readRequest>	rx_readRequestFifo("rx_readRequestFifo");
 	static stream<event>		rx_readEvenFifo("rx_readEvenFifo");
-	static stream<ackEvent>		rx_ackEventFifo("rx_ackEventFifo");
+	static stream<ap_uint<1> >	rx_respOrderFifo("rx_respOrderFifo");
+	static stream<ap_uint<1> >	tx_memCmdOrderFifo("tx_memCmdOrderFifo");
 	#pragma HLS STREAM depth=4 variable=exh_lengthFifo
 	#pragma HLS STREAM depth=8 variable=rx_readRequestFifo
 	#pragma HLS STREAM depth=512 variable=rx_readEvenFifo
-	#pragma HLS STREAM depth=32 variable=rx_ackEventFifo
+	#pragma HLS STREAM depth=64 variable=rx_respOrderFifo
+	#pragma HLS STREAM depth=64 variable=tx_memCmdOrderFifo
 #if defined( __VITIS_HLS__)
 	#pragma HLS aggregate  variable=rx_readRequestFifo compact=bit
 	#pragma HLS aggregate  variable=rx_readEvenFifo compact=bit
-	#pragma HLS aggregate  variable=rx_ackEventFifo compact=bit
 #else
 	#pragma HLS DATA_PACK variable=rx_readRequestFifo
 	#pragma HLS DATA_PACK variable=rx_readEvenFifo
-	#pragma HLS DATA_PACK variable=rx_ackEventFifo
 #endif
 
 	// Read Req Table
@@ -2495,7 +2569,10 @@ void ib_transport_protocol(
     #pragma HLS STREAM depth=16 variable=retrans2rx_init
 	#pragma HLS STREAM depth=2 variable=rx2retrans_req
 	#pragma HLS STREAM depth=2 variable=timer2retrans_req
-	#pragma HLS STREAM depth=2 variable=tx2retrans_insertMeta
+	// insertMeta as deep as insertAddrLen: a request writes its AddrLen entry
+	// before its Meta entry and both leave together, so generate_ibh never
+	// waits on the retransmitter
+	#pragma HLS STREAM depth=8 variable=tx2retrans_insertMeta
 	#pragma HLS STREAM depth=8 variable=tx2retrans_insertAddrLen
 	#pragma HLS STREAM depth=2 variable=tx2retrans_insertRequest
 	#pragma HLS STREAM depth=8 variable=retransmitter2exh_eventFifo
@@ -2608,6 +2685,7 @@ void ib_transport_protocol(
 		rxExh2msnTable_upd_req,
 		//rx_readReqAddr_pop_req,
 		rx_exhEventMetaFifo,
+		rx_respOrderFifo,
 		//rx_rethSift2mergerFifo,
 		//rx_exh2aethShiftFifo,
 		//rx_exhNoShiftFifo,
@@ -2633,8 +2711,7 @@ void ib_transport_protocol(
 		rx_readEvenFifo
 	);
 
-	//TODO is order important??
-	stream_merger<ackEvent>(rx_exhEventMetaFifo, rx_ibhEventFifo, rx_ackEventFifo);
+	// ACK events and READ responses are merged in meta_merger, in request order
 
 	// RETH: 16 bytes
 	//TODO not required for AXI_WIDTH == 64, also this seems to have a bug, this goes together with the hack in process_exh where we don't write the first word out
@@ -2686,7 +2763,8 @@ void ib_transport_protocol(
 	stream_merger(tx_split2rethMerge, tx_appDataFifo, tx_rethMerge2rethShift);
 #endif
 	//merges and orders event going to TX path
-	meta_merger<INSTID>(rx_ackEventFifo, rx_readEvenFifo, tx_appMetaFifo, tx_ibhconnTable_req, tx_ibhMetaFifo, tx_exhMetaFifo);
+	meta_merger<INSTID>(rx_ibhEventFifo, rx_exhEventMetaFifo, rx_respOrderFifo, rx_readEvenFifo, tx_appMetaFifo,
+		tx_ibhconnTable_req, tx_ibhMetaFifo, tx_exhMetaFifo, tx_memCmdOrderFifo);
 
 	//Shift playload by 4 bytes for AETH (data from memory)
 	lshiftWordByOctet<WIDTH,12,INSTID>(((AETH_SIZE%WIDTH)/8), tx_split2aethShift, tx_aethShift2payFifo);
@@ -2730,7 +2808,7 @@ void ib_transport_protocol(
 	tx_ipUdpMetaMerger(tx_connTable2ibh_rsp, tx_lengthFifo, m_axis_tx_meta, tx_dstQpFifo);
 
 	//merge read requests
-	mem_cmd_merger<WIDTH>(rx_remoteMemCmd, tx_localMemCmdFifo, m_axis_mem_read_cmd, tx_pkgInfoFifo);
+	mem_cmd_merger<WIDTH>(rx_remoteMemCmd, tx_localMemCmdFifo, tx_memCmdOrderFifo, m_axis_mem_read_cmd, tx_pkgInfoFifo);
 
 
 	// ------------------------------------------------------------------------------------------------
