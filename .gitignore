@@ -52,3 +52,7 @@ synth/
 *.csv
 *.out
 
+
+# repository folders named like the tool output folders above
+!/sim/
+!/doc/
