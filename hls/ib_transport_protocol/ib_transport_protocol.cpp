@@ -316,7 +316,12 @@ void rx_ibh_fsm(
                 m_axis_dbg.write(psnPkg(meta.op_code, meta.psn, qpState.epsn, 0));
             #endif
 
-			if (qpState.epsn == meta.psn || meta.op_code == RC_ACK)
+			// READ responses all go on: the retransmitter takes the one the
+			// oldest outstanding READ waits for and drops the others, as the
+			// PSN expected here also moves with the ACKs of later requests
+			bool readResp = isResponse && meta.op_code != RC_ACK;
+			bool inOrder = qpState.epsn == meta.psn;
+			if (inOrder || meta.op_code == RC_ACK || readResp)
 			{
 
 				// Forwarding
@@ -331,7 +336,7 @@ void rx_ibh_fsm(
 
 				// Update psn
 				//TODO for last param we need vaddr here!
-				if (!emeta.isNak && (meta.op_code != RC_ACK || ((qpState.epsn <= meta.psn && meta.psn <= qpState.max_forward)
+				if (!emeta.isNak && (!readResp || inOrder) && (meta.op_code != RC_ACK || ((qpState.epsn <= meta.psn && meta.psn <= qpState.max_forward)
 					|| ((qpState.epsn <= meta.psn || meta.psn <= qpState.max_forward) && qpState.max_forward < qpState.epsn))))
 				{
 					// if the next req is invalid, trigger NAK
@@ -340,7 +345,8 @@ void rx_ibh_fsm(
 #ifdef RETRANS_EN
 
 				// Update oldest-unacked-reqeust
-				if (isResponse && !emeta.isNak)
+				// every READ response gets the retransmitter's verdict
+				if (isResponse && (!emeta.isNak || readResp))
 				{
 					std::cout << std::hex <<"[RX IBH FSM " << INSTID << "]: retrans update, psn " << meta.psn << std::endl;
 
@@ -360,7 +366,7 @@ void rx_ibh_fsm(
 					rx2retrans_upd.write(retransUpdate(meta.dest_qp, meta.psn - 1, RC_ACK));
 				}
 				// Check if no oustanding requests -> stop timer
-				if (isResponse && meta.op_code != RC_RDMA_READ_RESP_MIDDLE)
+				if (isResponse && meta.op_code != RC_RDMA_READ_RESP_MIDDLE && (!readResp || inOrder))
 				{
 					rxClearTimer_req.write(rxTimerUpdate(meta.dest_qp, meta.psn == qpState.max_forward));
 #ifndef __SYNTHESIS__
@@ -554,7 +560,8 @@ void rx_exh_fsm(
 			}*/
 #endif
 			// RC_ACK completions come from the retransmitter, one per released request
-			if (meta.op_code == RC_RDMA_READ_RESP_ONLY || meta.op_code == RC_RDMA_READ_RESP_FIRST)
+			if (meta.op_code == RC_RDMA_READ_RESP_ONLY || meta.op_code == RC_RDMA_READ_RESP_FIRST ||
+				meta.op_code == RC_RDMA_READ_RESP_MIDDLE || meta.op_code == RC_RDMA_READ_RESP_LAST)
 			{
 				consumeReadInit = true;
 				//rx_readReqAddr_pop_req.write(mqPopReq(meta.dest_qp));
@@ -710,6 +717,13 @@ void rx_exh_fsm(
 			// [BTH][AETH][PayLd]
 			//AETH for first and last
 			AckExHeader<WIDTH> ackHeader = exHeader.getAckHeader();
+			if (readReqInit.drop)
+			{
+				// not the response the oldest READ waits for: payload discarded
+				rx_pkgSplitTypeFifo.write(pkgSplit(meta.op_code, true));
+				pe_fsmState = META;
+				break;
+			}
 			if(meta.op_code == RC_RDMA_READ_RESP_ONLY || meta.op_code == RC_RDMA_READ_RESP_LAST)
 			{
 				m_axis_rx_ack_meta.write(ackMeta(meta.op_code, meta.dest_qp(15,0), readReqInit.host, 
@@ -721,7 +735,7 @@ void rx_exh_fsm(
 			{
 				//Trigger retransmit
 #ifdef RETRANS_EN
-				rx2retrans_req.write(retransmission(meta.dest_qp, meta.psn));
+				rx2retrans_req.write_nb(retransmission(meta.dest_qp, meta.psn));
 #endif
 			}
 			/*else
@@ -758,6 +772,12 @@ void rx_exh_fsm(
 		}
 		case RC_RDMA_READ_RESP_MIDDLE:
 			// [BTH][PayLd]
+			if (readReqInit.drop)
+			{
+				rx_pkgSplitTypeFifo.write(pkgSplit(meta.op_code, true));
+				pe_fsmState = META;
+				break;
+			}
 			payLoadLength = udpLength - (8 + 12 + 4); //UDP, BTH, CRC
 			rx_pkgShiftTypeFifo.write(pkgShift(SHIFT_NONE, meta.dest_qp));
 			memoryWriteCmd.write(memCmd(meta.op_code, meta.dest_qp, PKG_NF, dmaMeta.vaddr, payLoadLength, PKG_NR, PKG_HOST, 0));
@@ -782,9 +802,11 @@ void rx_exh_fsm(
 #ifdef RETRANS_EN
 			if (ackHeader.isNAK())
 			{
-				//Trigger retransmit
+				//Trigger retransmit (never waits: RX must not wait for the
+				// retransmitter, which may wait for TX; a request that does not
+				// fit is left to the transport timer)
 				std::cout << "[RX EXH FSM " << INSTID << "]: receive NAK" << std::endl;
-				rx2retrans_req.write(retransmission(meta.dest_qp, meta.psn));
+				rx2retrans_req.write_nb(retransmission(meta.dest_qp, meta.psn));
 			}
 			/*else if (readReqMeta.oldest_outstanding_readreq < meta.psn && readReqMeta.valid)
 			{
@@ -909,7 +931,11 @@ void rx_exh_payload(
 		{
 			input.read(currWord); 
 
-			if (checkIfRethHeader(meta.op_code))
+			if (meta.drop)
+			{
+				// READ response the retransmitter dropped
+			}
+			else if (checkIfRethHeader(meta.op_code))
 			{
 #ifdef DBG_FULL
 				std::cout << "[RX EXH PAYLOAD" << INSTID << "]: EXH payload";

@@ -305,9 +305,12 @@ struct event
 struct pkgSplit
 {
 	ibOpCode op_code;
+	bool drop;
 	pkgSplit() {}
 	pkgSplit(ibOpCode op)
-		:op_code(op) {}
+		:op_code(op), drop(false) {}
+	pkgSplit(ibOpCode op, bool drop)
+		:op_code(op), drop(drop) {}
 };
 
 struct pkgShift

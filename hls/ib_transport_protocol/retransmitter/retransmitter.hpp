@@ -46,14 +46,19 @@ struct retransUpdate
 		:qpn(qpn), latest_acked_req(psn), op_code(op_code) {}
 };
 
+// The retransmitter's verdict on one READ response packet: the packet is the
+// one the oldest outstanding READ waits for (laddr, lst, host of that READ), or
+// it is dropped
 struct retransRdInit
 {
     ap_uint<64> laddr;
     ap_uint<1>  lst;
     ap_uint<1>  host;
-    retransRdInit() {}
+    bool        drop;
+    retransRdInit()
+        :laddr(0), lst(0), host(0), drop(true) {}
     retransRdInit(ap_uint<64> laddr, ap_uint<1> lst, ap_uint<1> host)
-        :laddr(laddr), lst(lst), host(host) {}
+        :laddr(laddr), lst(lst), host(host), drop(false) {}
 };
 
 struct retransmission
@@ -312,7 +317,7 @@ void process_retransmissions(
 #pragma HLS PIPELINE II=1
 #pragma HLS INLINE off
 
-	enum retransStateType {MAIN, INSERT_0, INSERT_1, UPDATE_0, UPDATE_1, RETRANS_0, RETRANS_1, RETRANS_2, TIMER_RETRANS_0};
+	enum retransStateType {MAIN, INSERT_0, INSERT_1, UPDATE_0, UPDATE_1, RETRANS_0, RETRANS_1, RETRANS_2, TIMER_RETRANS_0, REPLAY};
 	static retransStateType rt_state = MAIN;
 	static retransUpdate update;
 	static ap_uint<16> curr;
@@ -321,6 +326,18 @@ void process_retransmissions(
 	static retransmission retrans;
 	static retransMetaEntry meta; //TODO register needed??
 	static retransPointerEntry ptrMeta;
+	// last implied NAK (qpn, psn of the READ resent), so that the responses
+	// and ACKs still in flight behind a lost READ response resend it once
+	static bool impliedValid = false;
+	static ap_uint<16> impliedQpn;
+	static ap_uint<24> impliedPsn;
+	// A replay sends one request after the other into retrans2event. When that
+	// is full (TX busy), the next request waits in replayMeta and the updates
+	// are served meanwhile: RX waits for their READ response verdicts, so a
+	// replay waiting for TX must not stop RX (on a link that holds TX until
+	// the far end's RX is ready, both ends would wait for each other)
+	static bool replaying = false;
+	static retransMetaEntry replayMeta;
 
 	switch (rt_state)
 	{
@@ -405,7 +422,12 @@ void process_retransmissions(
 				// Nothing outstanding, e.g. a duplicate ACK. Release lock
 				std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_0 nothing outstanding" << std::endl;
 				pointerUpdFifo.write(pointerUpdate(update.qpn, ptrMeta));
-				rt_state = MAIN;
+				if (update.op_code != RC_ACK)
+				{
+					// a READ response nobody waits for
+					retrans2rx_init.write(retransRdInit());
+				}
+				rt_state = replaying ? REPLAY : MAIN;
 			}
 		}
 		break;
@@ -441,7 +463,12 @@ void process_retransmissions(
 				{
 					// update the lock
 					pointerUpdFifo.write(pointerUpdate(update.qpn, ptrMeta));
-					rt_state = MAIN;
+					if (isReadResp)
+					{
+						// a READ response nobody waits for
+						retrans2rx_init.write(retransRdInit());
+					}
+					rt_state = replaying ? REPLAY : MAIN;
 				}
 				else
 				{
@@ -451,15 +478,17 @@ void process_retransmissions(
 			}
 			else
 			{
-				if (meta.valid && isReadResp && meta.opCode == RC_RDMA_READ_REQUEST)
+				// A READ is answered in PSN order: meta.psn is the PSN of its next
+				// response packet. Only that packet is taken. A later response, or
+				// an ACK of a later request, means a response of this READ was
+				// lost (implied NAK): the packet is dropped, as the responses of
+				// later READs would land at this READ's address, and everything
+				// from this READ on is sent again
+				bool isRead = meta.valid && meta.opCode == RC_RDMA_READ_REQUEST;
+				if (isRead && isReadResp && meta.psn == update.latest_acked_req)
 				{
-					// Address forwarding
-					if (update.op_code == RC_RDMA_READ_RESP_FIRST || update.op_code == RC_RDMA_READ_RESP_ONLY)
-					{
-						retrans2rx_init.write(retransRdInit(meta.localAddr, meta.lst, meta.host));
-
-						std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_1 forwarding local address, laddr " << meta.localAddr << ", last" << meta.lst << std::endl;
-					}
+					retrans2rx_init.write(retransRdInit(meta.localAddr, meta.lst, meta.host));
+					std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_1 read response psn " << meta.psn << ", laddr " << meta.localAddr << ", last " << meta.lst << std::endl;
 
 					if (update.op_code == RC_RDMA_READ_RESP_FIRST || update.op_code == RC_RDMA_READ_RESP_MIDDLE)
 					{
@@ -484,12 +513,35 @@ void process_retransmissions(
 
 						std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_1 read update, psn " << meta.psn << std::endl;
 					}
+					// update the lock
+					pointerUpdFifo.write(pointerUpdate(update.qpn, ptrMeta));
+					rt_state = replaying ? REPLAY : MAIN;
 				}
+				else
+				{
+					if (isReadResp)
+					{
+						retrans2rx_init.write(retransRdInit());
+						std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: state UPDATE_1 dropping read response psn " << update.latest_acked_req << std::endl;
+					}
+					// update the lock
+					pointerUpdFifo.write(pointerUpdate(update.qpn, ptrMeta));
+					rt_state = replaying ? REPLAY : MAIN;
 
-				// update the lock
-				pointerUpdFifo.write(pointerUpdate(update.qpn, ptrMeta));
-				// return to main
-				rt_state = MAIN;
+					// (not while another replay waits: the timer covers that case)
+					if (!replaying && isRead && psn_before(meta.psn, releaseBefore) &&
+						!(impliedValid && impliedQpn == update.qpn && impliedPsn == meta.psn))
+					{
+						std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: implied NAK, retransmitting from read psn " << meta.psn << std::endl;
+						impliedValid = true;
+						impliedQpn = update.qpn;
+						impliedPsn = meta.psn;
+						retrans.qpn = update.qpn;
+						replayMeta = meta;
+						replaying = true;
+						rt_state = REPLAY;
+					}
+				}
 			}
 		}
 		break;
@@ -519,13 +571,9 @@ void process_retransmissions(
 				// check if we should start retransmitting
 				if (meta.psn == retrans.psn)
 				{
-					std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: retransmitting psn " << meta.psn << std::endl;
-					retrans2event.write(retransEvent(meta.opCode, retrans.qpn, meta.localAddr, meta.remoteAddr, meta.length, meta.psn, meta.lst, meta.offs));
-					if (!meta.isTail)
-					{
-						metaReqFifo.write(retransMetaReq(meta.next));
-						rt_state = RETRANS_2;
-					}
+					replayMeta = meta;
+					replaying = true;
+					rt_state = REPLAY;
 				}
 				else if (!meta.isTail)
 				{
@@ -545,19 +593,37 @@ void process_retransmissions(
 		// Retransmit everything until reach tail
 		if (!metaRspFifo.empty())
 		{
-			metaRspFifo.read(meta);
-			rt_state = MAIN;
-			if (meta.valid)
+			metaRspFifo.read(replayMeta);
+			replaying = replayMeta.valid;
+			rt_state = replayMeta.valid ? REPLAY : MAIN;
+		}
+		break;
+	case REPLAY:
+		if (!retrans2event.full())
+		{
+			std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: retransmitting psn " << replayMeta.psn << std::endl;
+			retrans2event.write(retransEvent(replayMeta.opCode, retrans.qpn, replayMeta.localAddr, replayMeta.remoteAddr,
+				replayMeta.length, replayMeta.psn, replayMeta.lst, replayMeta.offs));
+			if (!replayMeta.isTail)
 			{
-				if (!meta.isTail)
-				{
-					// keep retransmitting
-					metaReqFifo.write(retransMetaReq(meta.next));
-					rt_state = RETRANS_2;
-				}
-				std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: retransmitting psn " << meta.psn << std::endl;
-				retrans2event.write(retransEvent(meta.opCode, retrans.qpn, meta.localAddr, meta.remoteAddr, meta.length, meta.psn, meta.lst, meta.offs));
+				// keep retransmitting
+				metaReqFifo.write(retransMetaReq(replayMeta.next));
+				rt_state = RETRANS_2;
 			}
+			else
+			{
+				replaying = false;
+				rt_state = MAIN;
+			}
+		}
+		else if (!rx2retrans_upd.empty())
+		{
+			// TX busy: serve an update meanwhile (it may release entries the
+			// replay still visits, which then go out once more: harmless, as
+			// no new entry can take their place before the replay ends)
+			rx2retrans_upd.read(update);
+			pointerReqFifo.write(pointerReq(update.qpn, true));
+			rt_state = UPDATE_0;
 		}
 		break;
 	case TIMER_RETRANS_0:
@@ -565,6 +631,8 @@ void process_retransmissions(
 		{
 			std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: timed out, retransmitting qpn " << retrans.qpn << std::endl;
 			pointerRspFifo.read(ptrMeta);
+			// the resent READ may be lost again: allow another implied NAK
+			impliedValid = false;
 			if (ptrMeta.valid)
 			{
 				// Get continuous stream of meta entries
