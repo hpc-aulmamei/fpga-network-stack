@@ -12,6 +12,7 @@
 // Plusargs: +N=<4 KiB requests per throughput test> +MIXED=<messages>
 //           +DROP=<drop 1 in N RoCE frames at random, 0 = none> +LINE_GBPS=<link rate>
 //           +STALL=<1: random gaps in the payload streams>
+//           +REG_POSTS=<1 in N mixed messages posted through the registers, 0 = none>
 // (run_tb.sh turns +SEED=<n> into xsim -sv_seed <n>)
 module tb_rdma_stack;
     localparam int DATA_BITS = `DATA_BITS;
@@ -23,7 +24,8 @@ module tb_rdma_stack;
     int stall = 0;
     // mixed test: +MIX_OPS=1 WRITEs only, 2 READs only; +MIX_DIR=1 node A posts only;
     // +MIX_QP=<n> that QP only; +MIX_ALIGN=<bytes> lengths and addresses multiples of it
-    int mix_ops = 0, mix_dir = 0, mix_qp = 0, mix_align = 4;
+    int mix_ops = 0, mix_dir = 0, mix_qp = 0, mix_align = 4, reg_posts = 8;
+    logic [31:0] st_a [16], st_b [16], rv;
 
     logic clk = 1'b0;
     logic resetn = 1'b0;
@@ -34,31 +36,35 @@ module tb_rdma_stack;
         logic                 n``_rx_tvalid, n``_rx_tready, n``_rx_tlast, n``_tx_tvalid, n``_tx_tready, n``_tx_tlast; \
         logic [DATA_BITS-1:0] n``_rx_tdata, n``_tx_tdata; \
         logic [BYTES-1:0]     n``_rx_tkeep, n``_tx_tkeep; \
-        logic                 n``_qp_tvalid, n``_qp_tready, n``_sq_tvalid, n``_sq_tready, n``_cq_tvalid; \
-        logic                 n``_arp_tvalid = 1'b0, n``_arp_tready; \
-        logic [31:0]          n``_arp_tdata; \
-        logic [255:0]         n``_qp_tdata; \
+        logic                 n``_sq_tvalid, n``_sq_tready, n``_cq_tvalid; \
+        logic [11:0]          n``_awaddr, n``_araddr; \
+        logic                 n``_awvalid, n``_awready, n``_wvalid, n``_wready, n``_bvalid, n``_bready; \
+        logic                 n``_arvalid, n``_arready, n``_rvalid, n``_rready; \
+        logic [31:0]          n``_wdata, n``_rdata; \
+        logic [3:0]           n``_wstrb; \
         logic [191:0]         n``_sq_tdata; \
         logic [31:0]          n``_cq_tdata; \
         logic                 n``_rdq_tvalid, n``_rdq_tready, n``_wrq_tvalid, n``_wrq_tready; \
         logic [127:0]         n``_rdq_tdata, n``_wrq_tdata; \
         logic                 n``_rd_tvalid, n``_rd_tready, n``_rd_tlast, n``_wr_tvalid, n``_wr_tready, n``_wr_tlast; \
         logic [DATA_BITS-1:0] n``_rd_tdata, n``_wr_tdata; \
-        logic [BYTES-1:0]     n``_rd_tkeep, n``_wr_tkeep; \
-        logic [31:0]          n``_st [16];
+        logic [BYTES-1:0]     n``_rd_tkeep, n``_wr_tkeep;
 
     `RDMA_NODE_WIRES(a)
     `RDMA_NODE_WIRES(b)
 
-    `define RDMA_NODE(n, MAC, IP) \
+    `define RDMA_NODE(n) \
         `RDMA_TOP #(.DATA_BITS(DATA_BITS)) dut_``n ( \
-            .aclk(clk), .aresetn(resetn), .local_mac(MAC), .local_ip(IP), \
+            .aclk(clk), .aresetn(resetn), \
+            .s_axil_awaddr(n``_awaddr), .s_axil_awprot(3'd0), .s_axil_awvalid(n``_awvalid), .s_axil_awready(n``_awready), \
+            .s_axil_wdata(n``_wdata), .s_axil_wstrb(n``_wstrb), .s_axil_wvalid(n``_wvalid), .s_axil_wready(n``_wready), \
+            .s_axil_bresp(), .s_axil_bvalid(n``_bvalid), .s_axil_bready(n``_bready), \
+            .s_axil_araddr(n``_araddr), .s_axil_arprot(3'd0), .s_axil_arvalid(n``_arvalid), .s_axil_arready(n``_arready), \
+            .s_axil_rdata(n``_rdata), .s_axil_rresp(), .s_axil_rvalid(n``_rvalid), .s_axil_rready(n``_rready), \
             .s_axis_rx_tvalid(n``_rx_tvalid), .s_axis_rx_tready(n``_rx_tready), .s_axis_rx_tdata(n``_rx_tdata), \
             .s_axis_rx_tkeep(n``_rx_tkeep), .s_axis_rx_tlast(n``_rx_tlast), .s_axis_rx_tuser(1'b0), \
             .m_axis_tx_tvalid(n``_tx_tvalid), .m_axis_tx_tready(n``_tx_tready), .m_axis_tx_tdata(n``_tx_tdata), \
             .m_axis_tx_tkeep(n``_tx_tkeep), .m_axis_tx_tlast(n``_tx_tlast), \
-            .s_axis_arp_tvalid(n``_arp_tvalid), .s_axis_arp_tready(n``_arp_tready), .s_axis_arp_tdata(n``_arp_tdata), \
-            .s_axis_qp_tvalid(n``_qp_tvalid), .s_axis_qp_tready(n``_qp_tready), .s_axis_qp_tdata(n``_qp_tdata), \
             .s_axis_sq_tvalid(n``_sq_tvalid), .s_axis_sq_tready(n``_sq_tready), .s_axis_sq_tdata(n``_sq_tdata), \
             .m_axis_cq_tvalid(n``_cq_tvalid), .m_axis_cq_tdata(n``_cq_tdata), \
             .m_axis_rd_req_tvalid(n``_rdq_tvalid), .m_axis_rd_req_tready(n``_rdq_tready), .m_axis_rd_req_tdata(n``_rdq_tdata), \
@@ -66,16 +72,16 @@ module tb_rdma_stack;
             .s_axis_rd_tkeep(n``_rd_tkeep), .s_axis_rd_tlast(n``_rd_tlast), \
             .m_axis_wr_req_tvalid(n``_wrq_tvalid), .m_axis_wr_req_tready(n``_wrq_tready), .m_axis_wr_req_tdata(n``_wrq_tdata), \
             .m_axis_wr_tvalid(n``_wr_tvalid), .m_axis_wr_tready(n``_wr_tready), .m_axis_wr_tdata(n``_wr_tdata), \
-            .m_axis_wr_tkeep(n``_wr_tkeep), .m_axis_wr_tlast(n``_wr_tlast), \
-            .stat_rx_frames(n``_st[0]), .stat_tx_frames(n``_st[1]), .stat_arp_rx(n``_st[2]), .stat_arp_tx(n``_st[3]), \
-            .stat_icmp_rx(n``_st[4]), .stat_icmp_tx(n``_st[5]), .stat_roce_rx(n``_st[6]), .stat_roce_tx(n``_st[7]), \
-            .stat_psn_drops(n``_st[8]), .stat_retrans(n``_st[9]), .stat_icrc_drops(n``_st[10]), .stat_ack_held(n``_st[11]), \
-            .stat_tx_trimmed(n``_st[12]), .stat_stray_cq(n``_st[13]), .stat_fcs_drops(n``_st[14]), \
-            .stat_rx_overflows(n``_st[15]), .stat_tx_stalled() \
+            .m_axis_wr_tkeep(n``_wr_tkeep), .m_axis_wr_tlast(n``_wr_tlast) \
+        ); \
+        rdma_tb_axil axil_``n ( \
+            .clk(clk), .awaddr(n``_awaddr), .awvalid(n``_awvalid), .awready(n``_awready), \
+            .wdata(n``_wdata), .wstrb(n``_wstrb), .wvalid(n``_wvalid), .wready(n``_wready), \
+            .bvalid(n``_bvalid), .bready(n``_bready), .araddr(n``_araddr), .arvalid(n``_arvalid), \
+            .arready(n``_arready), .rdata(n``_rdata), .rvalid(n``_rvalid), .rready(n``_rready) \
         ); \
         rdma_tb_payload #(.DATA_BITS(DATA_BITS), .OFF(OFF)) mdl_``n ( \
             .clk(clk), .resetn(resetn), \
-            .qp_tvalid(n``_qp_tvalid), .qp_tready(n``_qp_tready), .qp_tdata(n``_qp_tdata), \
             .sq_tvalid(n``_sq_tvalid), .sq_tready(n``_sq_tready), .sq_tdata(n``_sq_tdata), \
             .cq_tvalid(n``_cq_tvalid), .cq_tdata(n``_cq_tdata), \
             .rdq_tvalid(n``_rdq_tvalid), .rdq_tready(n``_rdq_tready), .rdq_tdata(n``_rdq_tdata), \
@@ -86,8 +92,8 @@ module tb_rdma_stack;
             .wr_tkeep(n``_wr_tkeep), .wr_tlast(n``_wr_tlast) \
         );
 
-    `RDMA_NODE(a, 48'h02_00_00_00_00_0a, 32'h0a_00_00_01)
-    `RDMA_NODE(b, 48'h02_00_00_00_00_0b, 32'h0a_00_00_02)
+    `RDMA_NODE(a)
+    `RDMA_NODE(b)
 
     rdma_tb_link #(.DATA_BITS(DATA_BITS), .CLK_NS(CLK_NS)) link_ab (
         .clk(clk), .resetn(resetn), .line_gbps(line_gbps), .drop_every(drop),
@@ -105,6 +111,57 @@ module tb_rdma_stack;
     longint cyc = 0;
     int qps[3] = '{1, 2, 12};
     always @(posedge clk) cyc <= cyc + 1;
+
+    // ------------------------------------------------------------ registers
+    task automatic wr(input bit node_b, input logic [11:0] a, input logic [31:0] d);
+        if (node_b) axil_b.write(a, d); else axil_a.write(a, d);
+    endtask
+
+    task automatic rd(input bit node_b, input logic [11:0] a, output logic [31:0] d);
+        if (node_b) axil_b.read(a, d); else axil_a.read(a, d);
+    endtask
+
+    task automatic stat(input bit node_b, input int i, output logic [31:0] d);
+        rd(node_b, 12'h200 + 4 * i, d);
+    endtask
+
+    task automatic set_addr(input bit node_b, input logic [47:0] mac, input logic [31:0] ip);
+        wr(node_b, 12'h020, mac[31:0]);
+        wr(node_b, 12'h024, {16'd0, mac[47:32]});
+        wr(node_b, 12'h028, ip);
+    endtask
+
+    task automatic connect(input bit node_b, input int lqpn, input int rqpn, input int lpsn, input int rpsn,
+                           input logic [31:0] rip);
+        wr(node_b, 12'h040, lqpn);
+        wr(node_b, 12'h044, rqpn);
+        wr(node_b, 12'h048, lpsn);
+        wr(node_b, 12'h04C, rpsn);
+        wr(node_b, 12'h050, rip);
+        wr(node_b, 12'h054, 0);
+        wr(node_b, 12'h058, 0);
+        wr(node_b, 12'h05C, 0);
+    endtask
+
+    // a message through the register send queue: SQ_POST takes a new value
+    // only when the queue has room, so write and read back until it sticks
+    task automatic reg_post(input bit node_b, input bit read, input int qpn, input longint laddr,
+                            input longint raddr, input int len);
+        logic [31:0] db, back;
+        wr(node_b, 12'h080, {18'd0, 6'(qpn), 7'd0, read});
+        wr(node_b, 12'h084, len);
+        wr(node_b, 12'h088, laddr[31:0]);
+        wr(node_b, 12'h08C, laddr[47:32]);
+        wr(node_b, 12'h090, raddr[31:0]);
+        wr(node_b, 12'h094, raddr[47:32]);
+        if (node_b) mdl_b.count_post(len); else mdl_a.count_post(len);
+        rd(node_b, 12'h098, db);
+        db++;
+        do begin
+            wr(node_b, 12'h098, db);
+            rd(node_b, 12'h098, back);
+        end while (back != db);
+    endtask
 
     // all posted requests completed on both nodes
     task automatic wait_done(input string what, input longint timeout_cycles);
@@ -178,6 +235,7 @@ module tb_rdma_stack;
         void'($value$plusargs("MIX_DIR=%d", mix_dir));
         void'($value$plusargs("MIX_QP=%d", mix_qp));
         void'($value$plusargs("MIX_ALIGN=%d", mix_align));
+        void'($value$plusargs("REG_POSTS=%d", reg_posts));
         mdl_a.stall = stall;
         mdl_b.stall = stall;
         $display("tb_rdma_stack: %0d bits, link %0d Gb/s, drop every %0d, stall %0d",
@@ -185,34 +243,41 @@ module tb_rdma_stack;
 
         repeat (20) @(posedge clk);
         resetn = 1'b1;
+        repeat (20) @(posedge clk);
+
+        rd(0, 12'h000, rv);
+        if (rv != 32'h5244_4D41) begin
+            $display("FAIL: ID %h", rv);
+            fails++;
+        end
+        rd(0, 12'h008, rv);
+        $display("config: %0d bits, %0d retransmission QP bits, windows %0d / %0d",
+            rv[11:0], rv[15:12], rv[23:16], rv[31:24]);
+        set_addr(0, 48'h02_00_00_00_00_0a, 32'h0a_00_00_01);
+        set_addr(1, 48'h02_00_00_00_00_0b, 32'h0a_00_00_02);
         repeat (100) @(posedge clk);
 
         // resolve the peers first: a packet to an unresolved address is
         // dropped and only sent again by the retransmission timer
-        @(negedge clk);
-        a_arp_tdata = 32'h0a_00_00_02;
-        b_arp_tdata = 32'h0a_00_00_01;
-        a_arp_tvalid = 1'b1;
-        b_arp_tvalid = 1'b1;
-        do @(posedge clk); while (!(a_arp_tready && b_arp_tready));
-        @(negedge clk);
-        a_arp_tvalid = 1'b0;
-        b_arp_tvalid = 1'b0;
+        wr(0, 12'h02C, 32'h0a_00_00_02);
+        wr(1, 12'h02C, 32'h0a_00_00_01);
         repeat (2000) @(posedge clk);
-        if (a_st[2] == 0 || b_st[2] == 0) begin
-            $display("FAIL: ARP: a received %0d, b %0d ARP frames", a_st[2], b_st[2]);
+        stat(0, 2, st_a[2]);
+        stat(1, 2, st_b[2]);
+        if (st_a[2] == 0 || st_b[2] == 0) begin
+            $display("FAIL: ARP: a received %0d, b %0d ARP frames", st_a[2], st_b[2]);
             fails++;
         end
 
         // QPs 1 and 2 retransmit from the on-chip buffer, 12 from the source
         foreach (qps[i]) begin
-            mdl_a.connect(qps[i], qps[i], 24'h000100 + qps[i], 24'h000300 + qps[i], 32'h0a_00_00_02);
-            mdl_b.connect(qps[i], qps[i], 24'h000300 + qps[i], 24'h000100 + qps[i], 32'h0a_00_00_01);
+            connect(0, qps[i], qps[i], 24'h000100 + qps[i], 24'h000300 + qps[i], 32'h0a_00_00_02);
+            connect(1, qps[i], qps[i], 24'h000300 + qps[i], 24'h000100 + qps[i], 32'h0a_00_00_01);
         end
         repeat (20) @(posedge clk);
 
-        // one small WRITE (resolves the peer's MAC first)
-        mdl_a.post(0, 1, 64'h1000 + OFF, 64'h1000, 64);
+        // one small WRITE through the register send queue
+        reg_post(0, 0, 1, 64'h1000 + OFF, 64'h1000, 64);
         wait_done("single WRITE", 200_000);
         $display("single WRITE: done at cycle %0d", cyc);
 
@@ -229,10 +294,13 @@ module tb_rdma_stack;
                 automatic int len = mix_align * $urandom_range(1, 20480 / mix_align);
                 automatic longint la = 64'h4000_0000 + mix_align * $urandom_range(0, (1 << 22) / mix_align);
                 automatic longint ra = read ? la + OFF : la - OFF;
-                if (mix_dir == 1 || $urandom_range(1))
-                    mdl_a.post(read, q, la, ra, len);
-                else
+                automatic bit on_b = !(mix_dir == 1 || $urandom_range(1));
+                if (reg_posts != 0 && $urandom_range(reg_posts - 1) == 0)
+                    reg_post(on_b, read, q, la, ra, len);
+                else if (on_b)
                     mdl_b.post(read, q, la, ra, len);
+                else
+                    mdl_a.post(read, q, la, ra, len);
             end
             wait_done("mixed", 20_000_000);
             $display("mixed: %0d messages in %0d cycles = %.1f Gb/s", n_mixed, cyc - t0,
@@ -240,8 +308,22 @@ module tb_rdma_stack;
         end
 
         repeat (200) @(posedge clk);
-        foreach (a_st[i])
-            $display("stat %2d: a %0d b %0d", i, a_st[i], b_st[i]);
+        foreach (st_a[i]) begin
+            stat(0, i, st_a[i]);
+            stat(1, i, st_b[i]);
+            $display("stat %2d: a %0d b %0d", i, st_a[i], st_b[i]);
+        end
+        // completion counters: one per request, messages flagged
+        rd(0, 12'h108, rv);
+        if (rv != mdl_a.msgs_done) begin
+            $display("FAIL: CQ_MSGS of a %0d, model %0d", rv, mdl_a.msgs_done);
+            fails++;
+        end
+        rd(1, 12'h100, rv);
+        if (rv != mdl_b.done_reqs) begin
+            $display("FAIL: CQ_COUNT of b %0d, model %0d", rv, mdl_b.done_reqs);
+            fails++;
+        end
         $display("link: a->b %0d frames %0d bytes %0d dropped, b->a %0d frames %0d bytes %0d dropped, %0d cycles",
             link_ab.frames, link_ab.bytes, link_ab.dropped, link_ba.frames, link_ba.bytes, link_ba.dropped, cyc);
         fails += mdl_a.errors + mdl_b.errors;
@@ -250,11 +332,11 @@ module tb_rdma_stack;
                 mdl_a.msgs_done, mdl_a.msgs_posted, mdl_b.msgs_done, mdl_b.msgs_posted);
             fails++;
         end
-        if (drop == 0 && (a_st[9] != 0 || b_st[9] != 0 || a_st[8] != 0 || b_st[8] != 0)) begin
+        if (drop == 0 && (st_a[9] != 0 || st_b[9] != 0 || st_a[8] != 0 || st_b[8] != 0)) begin
             $display("FAIL: retransmissions or PSN drops without loss");
             fails++;
         end
-        if (a_st[13] != 0 || b_st[13] != 0) begin
+        if (st_a[13] != 0 || st_b[13] != 0) begin
             $display("FAIL: stray completions");
             fails++;
         end
@@ -344,9 +426,6 @@ module rdma_tb_payload #(
 ) (
     input  logic                   clk,
     input  logic                   resetn,
-    output logic                   qp_tvalid,
-    input  logic                   qp_tready,
-    output logic [255:0]           qp_tdata,
     output logic                   sq_tvalid,
     input  logic                   sq_tready,
     output logic [191:0]           sq_tdata,
@@ -380,23 +459,6 @@ module rdma_tb_payload #(
     longint sink_bytes = 0;
     int posted_reqs = 0, done_reqs = 0, msgs_posted = 0, msgs_done = 0;
 
-    // ---------------- QP setup
-    initial qp_tvalid = 1'b0;
-    // driven at the falling edge, so the DUT samples them race free
-    task automatic connect(input int lqpn, input int rqpn, input int lpsn, input int rpsn, input logic [31:0] rip);
-        @(negedge clk);
-        qp_tdata = '0;
-        qp_tdata[15:0] = lqpn;
-        qp_tdata[32 +: 24] = rqpn;
-        qp_tdata[64 +: 24] = lpsn;
-        qp_tdata[96 +: 24] = rpsn;
-        qp_tdata[128 +: 32] = rip;
-        qp_tvalid = 1'b1;
-        do @(posedge clk); while (!qp_tready);
-        @(negedge clk);
-        qp_tvalid = 1'b0;
-    endtask
-
     // ---------------- send queue
     logic [191:0] sq_q[$];
     task automatic post(input bit read, input int qpn, input longint laddr, input longint raddr, input int len);
@@ -407,9 +469,14 @@ module rdma_tb_payload #(
         w[64 +: 48] = laddr;
         w[128 +: 48] = raddr;
         sq_q.push_back(w);
+        count_post(len);
+    endtask
+
+    // a message posted elsewhere (the register send queue)
+    function automatic void count_post(input int len);
         posted_reqs += (len + 4095) / 4096;
         msgs_posted++;
-    endtask
+    endfunction
 
     function automatic bit idle();
         return done_reqs == posted_reqs && sq_q.size() == 0 && !sq_tvalid;
@@ -522,4 +589,74 @@ module rdma_tb_payload #(
         end
         wr_tready <= resetn && (w_busy || snk_a.size() > 0) && !(stall && $urandom_range(3) == 0);
     end
+endmodule
+
+// AXI4-Lite master: one access at a time, driven at the falling edge
+module rdma_tb_axil (
+    input  logic        clk,
+    output logic [11:0] awaddr,
+    output logic        awvalid,
+    input  logic        awready,
+    output logic [31:0] wdata,
+    output logic [3:0]  wstrb,
+    output logic        wvalid,
+    input  logic        wready,
+    input  logic        bvalid,
+    output logic        bready,
+    output logic [11:0] araddr,
+    output logic        arvalid,
+    input  logic        arready,
+    input  logic [31:0] rdata,
+    input  logic        rvalid,
+    output logic        rready
+);
+    initial begin
+        awvalid = 1'b0;
+        wvalid = 1'b0;
+        bready = 1'b0;
+        arvalid = 1'b0;
+        rready = 1'b0;
+        wstrb = 4'hF;
+    end
+
+    semaphore bus = new(1);
+
+    task automatic write(input logic [11:0] a, input logic [31:0] d);
+        bit aw_done = 0, w_done = 0;
+        bus.get();
+        @(negedge clk);
+        awaddr = a;
+        wdata = d;
+        awvalid = 1'b1;
+        wvalid = 1'b1;
+        while (!(aw_done && w_done)) begin
+            @(posedge clk);
+            if (awready) aw_done = 1;
+            if (wready) w_done = 1;
+            @(negedge clk);
+            if (aw_done) awvalid = 1'b0;
+            if (w_done) wvalid = 1'b0;
+        end
+        bready = 1'b1;
+        do @(posedge clk); while (!bvalid);
+        @(negedge clk);
+        bready = 1'b0;
+        bus.put();
+    endtask
+
+    task automatic read(input logic [11:0] a, output logic [31:0] d);
+        bus.get();
+        @(negedge clk);
+        araddr = a;
+        arvalid = 1'b1;
+        do @(posedge clk); while (!arready);
+        @(negedge clk);
+        arvalid = 1'b0;
+        rready = 1'b1;
+        do @(posedge clk); while (!rvalid);
+        d = rdata;
+        @(negedge clk);
+        rready = 1'b0;
+        bus.put();
+    endtask
 endmodule

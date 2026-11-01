@@ -56,7 +56,7 @@ set_property value_tcl_expr {} [ipx::get_user_parameters DATA_BITS -of_objects $
 # clock and reset
 set busifs {}
 foreach b [ipx::get_bus_interfaces -of_objects $core] {
-    if {[get_property abstraction_type_vlnv $b] eq "xilinx.com:interface:axis_rtl:1.0"} {
+    if {[get_property abstraction_type_vlnv $b] in {xilinx.com:interface:axis_rtl:1.0 xilinx.com:interface:aximm_rtl:1.0}} {
         lappend busifs [get_property name $b]
     }
 }
@@ -79,4 +79,4 @@ ipx::create_xgui_files $core
 ipx::update_checksums $core
 ipx::check_integrity $core
 ipx::save_core $core
-puts "rdma_package: [get_property vlnv $core] in $ip_dir, AXI4-Stream interfaces: $busifs"
+puts "rdma_package: [get_property vlnv $core] in $ip_dir, interfaces on aclk: $busifs"

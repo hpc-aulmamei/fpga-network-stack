@@ -23,7 +23,7 @@ RTL = [
     "roce_pkg.sv", "icrc_crc32_pkg.sv",
     "small_fifo.sv", "axis_skid.sv", "axis_pkt_merge.sv", "axis_width.sv", "rx_fcs_filter.sv",
     "icrc_core.sv", "roce_tx_trim.sv", "roce_ack_pacer.sv", "roce_flow.sv", "roce_payload.sv",
-    "roce_retrans_mem.sv", "roce_engine.sv", "eth_roce_stack.sv", "rdma_stack.sv",
+    "roce_retrans_mem.sv", "roce_engine.sv", "eth_roce_stack.sv", "rdma_ctrl.sv", "rdma_stack.sv",
 ]
 HLS_IPS = ["rocev2", "ip_handler", "mac_ip_encode", "arp_server_subnet", "icmp_server"]
 TOP = "rdma_stack"

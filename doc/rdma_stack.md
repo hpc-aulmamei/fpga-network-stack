@@ -52,8 +52,15 @@ Other targets:
 
 **Block design:** add `build/iprepo` (or the IP directory) to the project's
 IP repositories (Settings > IP > Repository) and add *RDMA stack 200G* from
-the catalog. All streams are AXI4-Stream interfaces associated with `aclk`
-/ `aresetn`.
+the catalog. `s_axil` is an AXI4-Lite slave with a 4 KiB address block (give
+it an address in the Address Editor); all streams are AXI4-Stream
+interfaces; everything is associated with `aclk` / `aresetn`.
+
+Minimal bring-up through the registers (offsets below): MAC (`0x020`,
+`0x024`), IPv4 address (`0x028`), an ARP lookup of each peer (`0x02C`), one
+QP per connection (`0x040` .. `0x05C`); then post messages either on
+`s_axis_sq` or through the register send queue (`0x080` .. `0x098`), serve
+the payload streams, and count completions (`m_axis_cq` or `0x100`).
 
 **RTL:** compile the files of `build/iprepo/rdma_200/rdma_200.f` (paths
 relative to that directory, top level last; `.sv` files as
@@ -94,39 +101,59 @@ contiguous from byte 0, only the last beat partial.
   The filter is store and forward with a buffer of
   2^`RX_FCS_FILTER_ADDR_BITS` beats and ignores `tready` (a MAC cannot be
   stalled): `s_axis_rx_tready` is then always 1 and frames that do not fit
-  are dropped and counted (`stat_rx_overflows`).
+  are dropped and counted (STATS 15).
 
-### Addresses: `local_mac[47:0]`, `local_ip[31:0]`
+### Registers: `s_axil` (AXI4-Lite, 32 bits, 4 KiB)
 
-Plain inputs, taken whenever they change. Subnet 255.255.255.0, the own
-address is the gateway.
+All registers are 32 bits. They take whole 32-bit writes only (all four
+byte strobes); other writes are answered and ignored. Reads have no side
+effects and a repeated write only repeats its configuration, so the
+interface is safe behind paths that split reads or deliver a write twice
+(PCIe BARs through a NoC). 64-bit values: low word at `a`, high at `a + 4`,
+not latched: read HI, LO, HI and again if the two HI reads differ.
 
-### ARP: `s_axis_arp` (32 bits)
+| Offset | Name | Access | Description |
+|---|---|---|---|
+| `0x000` | ID | R | `0x52444D41` ("RDMA") |
+| `0x004` | VERSION | R | `0x00010000`: 1.0 |
+| `0x008` | CONFIG | R | [11:0] `DATA_BITS`, [15:12] `RT_QP_BITS`, [23:16] `WR_WINDOW`, [31:24] `RD_WINDOW` |
+| `0x00C` | SCRATCH | RW | |
+| `0x010` / `0x014` | CYCLES | R | `aclk` cycles since reset (64 bit) |
+| `0x020` | MAC_LO | RW | own MAC, bits 31:0 (reset `02:00:00:00:00:00`) |
+| `0x024` | MAC_HI | RW | own MAC, bits 47:32 |
+| `0x028` | IP | RW | own IPv4 address (reset 10.0.0.1). Subnet 255.255.255.0, the own address is the gateway. MAC and IP go to the stack whenever they change |
+| `0x02C` | ARP_LOOKUP | RW | write: resolve this IPv4 address (see below) |
+| `0x030` | PENDING | R | [0] ARP lookup, [1] QP setup not yet taken by the stack |
+| `0x040` | QP_LOCAL_QPN | RW | local QPN (0 .. 63) |
+| `0x044` | QP_REMOTE_QPN | RW | remote QPN (24 bit) |
+| `0x048` | QP_LOCAL_PSN | RW | the first PSN expected **from** the peer |
+| `0x04C` | QP_REMOTE_PSN | RW | the first PSN sent **to** the peer |
+| `0x050` | QP_REMOTE_IP | RW | the peer's IPv4 address |
+| `0x054` | QP_REMOTE_PORT | RW | the peer's UDP port (0 = 4791) |
+| `0x058` | QP_RKEY | RW | r_key |
+| `0x05C` | QP_SET | RW | write: send the QP fields to the stack. [1:0] 0 = connect (all fields), 1 = r_key only, 2 = remote PSN only |
+| `0x080` | SQ_CTRL | RW | [0] 0 = RDMA WRITE, 1 = RDMA READ; [13:8] QPN |
+| `0x084` | SQ_LEN | RW | message length in bytes, a multiple of 4 (bits 1:0 are dropped) |
+| `0x088` / `0x08C` | SQ_LADDR | RW | local address (48 bit): WRITE source / READ destination |
+| `0x090` / `0x094` | SQ_RADDR | RW | remote virtual address (48 bit) |
+| `0x098` | SQ_POST | RW | write a value different from the one it reads (read, add 1, write) to queue the message above. Taken only when the 16-deep queue has room: read it back, and if it still has the old value, write again later. A repeated value queues nothing |
+| `0x09C` | SQ_STATUS | R | [4:0] messages queued, [8] queue full |
+| `0x0A0` / `0x0A4` | SQ_REQS | R | requests (of up to 4 KiB) handed to the transport, from both send queues |
+| `0x100` / `0x104` | CQ_COUNT | R | completions (one per request) |
+| `0x108` / `0x10C` | CQ_MSGS | R | completions that end a message |
+| `0x110` | CQ_LAST | R | the last completion, as on `m_axis_cq` |
+| `0x1FC` | TX_STALLED | R | [0] `m_axis_tx` has not moved for 2^16 cycles with data waiting |
+| `0x200` + 4 i | STATS | R | 32-bit counters from reset, i = 0 .. 15: RX frames, TX frames, ARP RX, ARP TX, ICMP RX, ICMP TX, RoCE RX, RoCE TX (packets into / out of the transport), PSN drops (out-of-sequence packets), retransmissions, ICRC drops, ACK hold cycles (`ACK_GAP_CYCLES`), TX packets trimmed, stray completions (transport completions with nothing outstanding: should stay 0), bad-FCS frames dropped, RX frames dropped for room (`RX_FCS_FILTER`) |
 
-An IPv4 address to resolve. The stack resolves addresses by itself, but
-**a packet to an unresolved address is dropped** and only sent again by the
-transport's retransmission timer, so send a lookup for every peer when
-setting up (and give it a few microseconds) to avoid that delay on the
-first request.
+**ARP:** the stack resolves addresses by itself, but **a packet to an
+unresolved address is dropped** and only sent again by the transport's
+retransmission timer, so look up every peer when setting up (and give it a
+few microseconds) to avoid that delay on the first request.
 
-### QP setup: `s_axis_qp` (256 bits)
-
-| Word | Bits  | Field |
-|------|-------|-------|
-| 0    | 15:0  | local QPN (0 .. 63) |
-| 0    | 17:16 | update: 0 = connect (all fields), 1 = r_key only, 2 = remote PSN only |
-| 1    | 23:0  | remote QPN |
-| 2    | 23:0  | local PSN: the first PSN expected **from** the peer |
-| 3    | 23:0  | remote PSN: the first PSN sent **to** the peer |
-| 4    | 31:0  | remote IPv4 address |
-| 5    | 15:0  | remote UDP port (0 = 4791) |
-| 6    | 31:0  | r_key |
-| 7    |       | reserved |
-
-So the two ends of a connection swap the PSNs: if node A has local 0x100 /
-remote 0x300, node B has local 0x300 / remote 0x100. Updates 1 and 2 use the
-transport's selective update (the `qp_interface` virtual-address codes
-0xDEADBEEF / 0xFEEDBEEF, which this IP sets internally).
+**QPs:** the two ends of a connection swap the PSNs: if node A has local
+0x100 / remote 0x300, node B has local 0x300 / remote 0x100. Updates 1 and 2
+use the transport's selective update (the `qp_interface` virtual-address
+codes 0xDEADBEEF / 0xFEEDBEEF, which the IP sets internally).
 
 ### Send queue: `s_axis_sq` (192 bits)
 
@@ -138,9 +165,11 @@ transport's selective update (the `qp_interface` virtual-address codes
 | 2, 3 | 47:0 | local address: WRITE source / READ destination |
 | 4, 5 | 47:0 | remote virtual address |
 
-A message is split into requests of at most 4 KiB (one PMTU each:
-WRITE_ONLY / READ_REQUEST packets), and the stack accepts the next message
-when the last request has been queued. A QP has at most `WR_WINDOW` WRITE
+The same layout as the register send queue; the two are served in turn,
+message by message, when both have one waiting. A message is split into
+requests of at most 4 KiB (one PMTU each: WRITE_ONLY / READ_REQUEST
+packets), and the stack accepts the next message when the last request has
+been queued. A QP has at most `WR_WINDOW` WRITE
 and `RD_WINDOW` READ requests outstanding; `s_axis_sq_tready` stays low
 while the request at the head waits for its window.
 
@@ -189,18 +218,6 @@ the other QPs the stack asks the source again for the same address, so the
 source must still hold a WRITE's data until it completes. READ responses
 are always re-read from the source.
 
-### Statistics
-
-32-bit counters from reset: `stat_rx_frames`, `stat_tx_frames`,
-`stat_arp_rx`, `stat_arp_tx`, `stat_icmp_rx`, `stat_icmp_tx`,
-`stat_roce_rx`, `stat_roce_tx` (packets into / out of the transport),
-`stat_psn_drops` (out-of-sequence packets), `stat_retrans`,
-`stat_icrc_drops`, `stat_ack_held` (cycles an ACK waited for
-`ACK_GAP_CYCLES`), `stat_tx_trimmed`, `stat_stray_cq` (transport
-completions with nothing outstanding: should stay 0), `stat_fcs_drops`,
-`stat_rx_overflows`; and `stat_tx_stalled`, set while `m_axis_tx` has not
-moved for 2^16 cycles with data waiting.
-
 ## Parameters
 
 | Parameter                 | Default | Meaning |
@@ -227,8 +244,9 @@ s_axis_rx -> [FCS filter] -> ip_handler -+-> arp_server_subnet -----------------
        roce_engine, icmp -> IP merge -> mac_ip_encode -> frame merge (+ARP) -> pad -> m_axis_tx
 ```
 
-`rtl/rdma_stack.sv` is the top level (the QP / send queue / completion
-formats above), `rtl/eth_roce_stack.sv` the stack itself; the comment at the
+`rtl/rdma_stack.sv` is the top level (send queue splitting and arbitration,
+completions, QP and address handover), `rtl/rdma_ctrl.sv` the registers,
+`rtl/eth_roce_stack.sv` the stack itself; the comment at the
 head of every file describes its block. `rtl/scripts/rdma_sources.py`
 collects one IP's sources (prefixing every module), `rdma_package.tcl`
 packages them, `rdma_ooc.tcl` checks the result.
@@ -274,11 +292,14 @@ fixed here:
 `sim/rdma/tb_rdma_stack.sv`: two IPs, a link model at line rate (frame
 bytes + 24 for FCS, preamble and inter-frame gap; `+DROP=n` drops one RoCE
 frame in n at random), payload models that check every byte and the length of
-every packet. Sequence: ARP, QP setup (QPs 1 and 2 with the retransmission
-buffer, QP 12 without), one small WRITE, `+N` 4 KiB WRITEs and READs
+every packet. Everything is set up through `s_axil`: ID and CONFIG check,
+MAC and IP, ARP, QP setup (QPs 1 and 2 with the retransmission buffer, QP 12
+without), one small WRITE through the register send queue, `+N` 4 KiB WRITEs and READs
 (throughput), `+MIXED` random messages of 4 B .. 20 KiB in both directions
-on all three QPs; then all messages must have completed, no byte may differ,
-and without loss there must be no retransmission or PSN drop.
+on all three QPs, 1 in `+REG_POSTS` (8) of them through the register send
+queue and the others on `s_axis_sq`; then all messages must have completed,
+no byte may differ, the completion registers must agree with the models, and
+without loss there must be no retransmission or PSN drop.
 
 `make rdma_<n>_sim` runs it (`RDMA_SIM_ARGS="+N=200 +MIXED=200 +DROP=50"`,
 `+STALL=1` for a stalling source / sink, `+SEED=n`, `+MIX_OPS`, `+MIX_DIR`,

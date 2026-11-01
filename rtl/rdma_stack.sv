@@ -8,20 +8,22 @@ import roce_pkg::*;
 // 1024 bits for 200G (make rdma_200), the width the HLS IPs were built at.
 //
 // This is the top level of the packaged IP; doc/rdma_stack.md describes the
-// interfaces. All addresses (IPv4, MAC) have their first octet in the top
-// bits. Every *_tdata layout is in units of 32-bit words, word 0 in bits 31:0.
+// interfaces and the register map. All addresses (IPv4, MAC) have their first
+// octet in the top bits. Every *_tdata layout is in units of 32-bit words,
+// word 0 in bits 31:0.
 //
+//   s_axil                   registers (rdma_ctrl, 4 KiB): MAC and IPv4
+//                            address, ARP lookup, QP setup, a send queue,
+//                            completion counters, statistics
 //   s_axis_rx / m_axis_tx    Ethernet frames without FCS (to / from the MAC).
 //                            TX frames are padded to 60 bytes (TX_PAD).
 //                            RX_FCS_FILTER = 1: s_axis_rx_tuser on the last
 //                            beat marks a bad FCS and such frames are dropped
 //                            (store and forward, s_axis_rx_tready is then 1).
-//   local_mac, local_ip      the node's addresses, taken whenever they change
-//   s_axis_arp               optional: resolve an IPv4 address ahead of the
-//                            first packet to it (the stack resolves on its own)
-//   s_axis_qp                connect a QP / update its r_key or send PSN
 //   s_axis_sq                RDMA WRITE / READ of any length (a multiple of
-//                            4 bytes), split into requests of at most 4 KiB
+//                            4 bytes), split into requests of at most 4 KiB;
+//                            shared with the register send queue, message by
+//                            message
 //   m_axis_cq                one completion per request, flagged on the last
 //                            request of a message; never stalls (no tready)
 //   m_axis_rd_req / s_axis_rd    payload source: the stack asks for the
@@ -29,7 +31,6 @@ import roce_pkg::*;
 //                            them in request order, a packet per request
 //   m_axis_wr_req / m_axis_wr    payload sink: incoming WRITE and READ
 //                            response payload, a packet per request
-//   stat_*                   counters, free running from reset
 module rdma_stack #(
     parameter integer DATA_BITS = 1024,
     parameter integer RT_QP_BITS = 3,           // QPs 0 .. 2^RT_QP_BITS-1 can retransmit WRITEs
@@ -44,8 +45,26 @@ module rdma_stack #(
     input  wire                    aclk,
     input  wire                    aresetn,
 
-    input  wire [47:0]             local_mac,
-    input  wire [31:0]             local_ip,
+    // registers
+    input  wire [11:0]             s_axil_awaddr,
+    input  wire [2:0]              s_axil_awprot,
+    input  wire                    s_axil_awvalid,
+    output wire                    s_axil_awready,
+    input  wire [31:0]             s_axil_wdata,
+    input  wire [3:0]              s_axil_wstrb,
+    input  wire                    s_axil_wvalid,
+    output wire                    s_axil_wready,
+    output wire [1:0]              s_axil_bresp,
+    output wire                    s_axil_bvalid,
+    input  wire                    s_axil_bready,
+    input  wire [11:0]             s_axil_araddr,
+    input  wire [2:0]              s_axil_arprot,
+    input  wire                    s_axil_arvalid,
+    output wire                    s_axil_arready,
+    output wire [31:0]             s_axil_rdata,
+    output wire [1:0]              s_axil_rresp,
+    output wire                    s_axil_rvalid,
+    input  wire                    s_axil_rready,
 
     // network
     input  wire                    s_axis_rx_tvalid,
@@ -60,25 +79,6 @@ module rdma_stack #(
     output wire [DATA_BITS-1:0]    m_axis_tx_tdata,
     output wire [DATA_BITS/8-1:0]  m_axis_tx_tkeep,
     output wire                    m_axis_tx_tlast,
-
-    // ARP lookup: IPv4 address
-    input  wire                    s_axis_arp_tvalid,
-    output wire                    s_axis_arp_tready,
-    input  wire [31:0]             s_axis_arp_tdata,
-
-    // QP setup, 8 words:
-    //   0  [15:0] local QPN, [17:16] update: 0 = connect (all fields),
-    //      1 = r_key only, 2 = remote PSN only
-    //   1  [23:0] remote QPN
-    //   2  [23:0] local PSN: the first PSN expected from the peer
-    //   3  [23:0] remote PSN: the first PSN sent to the peer
-    //   4  remote IPv4 address
-    //   5  [15:0] remote UDP port (0 = 4791)
-    //   6  r_key
-    //   7  reserved
-    input  wire                    s_axis_qp_tvalid,
-    output wire                    s_axis_qp_tready,
-    input  wire [255:0]            s_axis_qp_tdata,
 
     // send queue, 6 words:
     //   0  [0] 0 = RDMA WRITE, 1 = RDMA READ; [13:8] QPN
@@ -119,26 +119,7 @@ module rdma_stack #(
     input  wire                    m_axis_wr_tready,
     output wire [DATA_BITS-1:0]    m_axis_wr_tdata,
     output wire [DATA_BITS/8-1:0]  m_axis_wr_tkeep,
-    output wire                    m_axis_wr_tlast,
-
-    // statistics
-    output wire [31:0]             stat_rx_frames,      // into the stack
-    output wire [31:0]             stat_tx_frames,
-    output wire [31:0]             stat_arp_rx,
-    output wire [31:0]             stat_arp_tx,
-    output wire [31:0]             stat_icmp_rx,
-    output wire [31:0]             stat_icmp_tx,
-    output wire [31:0]             stat_roce_rx,        // RoCE packets into the transport
-    output wire [31:0]             stat_roce_tx,
-    output wire [31:0]             stat_psn_drops,      // out-of-sequence packets dropped
-    output wire [31:0]             stat_retrans,        // retransmissions
-    output wire [31:0]             stat_icrc_drops,
-    output wire [31:0]             stat_ack_held,       // cycles an ACK was held (ACK_GAP_CYCLES)
-    output wire [31:0]             stat_tx_trimmed,
-    output wire [31:0]             stat_stray_cq,       // transport completions with nothing outstanding
-    output wire [31:0]             stat_fcs_drops,      // RX_FCS_FILTER: bad FCS
-    output wire [31:0]             stat_rx_overflows,   // RX_FCS_FILTER: no room
-    output wire                    stat_tx_stalled      // TX blocked for 2^16 cycles
+    output wire                    m_axis_wr_tlast
 );
     localparam integer BYTES = DATA_BITS / 8;
     localparam integer QP_BITS = 6;
@@ -153,6 +134,41 @@ module rdma_stack #(
     logic resetn = 1'b0;
     always_ff @(posedge aclk)
         resetn <= aresetn;
+
+    // ------------------------------------------------------------ registers
+    localparam integer NSTATS = 16;
+
+    logic [47:0]          local_mac;
+    logic [31:0]          local_ip;
+    logic                 arp_valid, arp_ready;
+    logic [31:0]          arp_data;
+    logic                 qpw_valid, qpw_ready;
+    logic [255:0]         qpw_data;
+    logic                 rsq_valid, rsq_ready;
+    logic [191:0]         rsq_data;
+    logic [NSTATS*32-1:0] stat_words;
+    logic                 tx_stalled;
+    logic                 sq_valid, sq_ready;
+    sq_req_t              sq_data;
+
+    rdma_ctrl #(
+        .DATA_BITS(DATA_BITS), .RT_QP_BITS(RT_QP_BITS), .WR_WINDOW(WR_WINDOW), .RD_WINDOW(RD_WINDOW),
+        .NSTATS(NSTATS)
+    ) inst_ctrl (
+        .clk(aclk), .resetn(resetn),
+        .s_axil_awaddr(s_axil_awaddr), .s_axil_awvalid(s_axil_awvalid), .s_axil_awready(s_axil_awready),
+        .s_axil_wdata(s_axil_wdata), .s_axil_wstrb(s_axil_wstrb), .s_axil_wvalid(s_axil_wvalid),
+        .s_axil_wready(s_axil_wready), .s_axil_bresp(s_axil_bresp), .s_axil_bvalid(s_axil_bvalid),
+        .s_axil_bready(s_axil_bready), .s_axil_araddr(s_axil_araddr), .s_axil_arvalid(s_axil_arvalid),
+        .s_axil_arready(s_axil_arready), .s_axil_rdata(s_axil_rdata), .s_axil_rresp(s_axil_rresp),
+        .s_axil_rvalid(s_axil_rvalid), .s_axil_rready(s_axil_rready),
+        .local_mac(local_mac), .local_ip(local_ip),
+        .m_arp_valid(arp_valid), .m_arp_ready(arp_ready), .m_arp_data(arp_data),
+        .m_qp_valid(qpw_valid), .m_qp_ready(qpw_ready), .m_qp_data(qpw_data),
+        .m_sq_valid(rsq_valid), .m_sq_ready(rsq_ready), .m_sq_data(rsq_data),
+        .sq_req(sq_valid && sq_ready), .cq_valid(m_axis_cq_tvalid), .cq_data(m_axis_cq_tdata),
+        .stats(stat_words), .tx_stalled(tx_stalled)
+    );
 
     // ------------------------------------------------------------ addresses
     // handed to the stack on every change and for a few cycles after reset
@@ -210,7 +226,7 @@ module rdma_stack #(
     qp_ctx_hls_t  qp_data;
     qp_conn_hls_t conn_data;
 
-    assign s_axis_qp_tready = !qp_busy;
+    assign qpw_ready = !qp_busy;
 
     always_ff @(posedge aclk) begin
         if (!resetn) begin
@@ -221,46 +237,52 @@ module rdma_stack #(
                 qp_valid <= 1'b0;
             if (conn_ready)
                 conn_valid <= 1'b0;
-            if (s_axis_qp_tvalid && s_axis_qp_tready) begin
+            if (qpw_valid && qpw_ready) begin
                 qp_valid <= 1'b1;
-                conn_valid <= s_axis_qp_tdata[17:16] != 2'd1 && s_axis_qp_tdata[17:16] != 2'd2;
+                conn_valid <= qpw_data[17:16] != 2'd1 && qpw_data[17:16] != 2'd2;
             end
         end
     end
     assign qp_busy = qp_valid || conn_valid;
 
     always_ff @(posedge aclk) begin
-        if (s_axis_qp_tvalid && s_axis_qp_tready) begin
+        if (qpw_valid && qpw_ready) begin
             qp_data <= '0;
-            qp_data.qp_num <= 24'(s_axis_qp_tdata[15:0]);
+            qp_data.qp_num <= 24'(qpw_data[15:0]);
             qp_data.new_state <= 32'd2;                         // READY_RECV
-            qp_data.local_psn <= s_axis_qp_tdata[64 +: 24];
-            qp_data.remote_psn <= s_axis_qp_tdata[96 +: 24];
-            qp_data.r_key <= s_axis_qp_tdata[192 +: 32];
-            qp_data.vaddr <= s_axis_qp_tdata[17:16] == 2'd1 ? VADDR_RKEY_ONLY :
-                             s_axis_qp_tdata[17:16] == 2'd2 ? VADDR_RPSN_ONLY : 48'd0;
+            qp_data.local_psn <= qpw_data[64 +: 24];
+            qp_data.remote_psn <= qpw_data[96 +: 24];
+            qp_data.r_key <= qpw_data[192 +: 32];
+            qp_data.vaddr <= qpw_data[17:16] == 2'd1 ? VADDR_RKEY_ONLY :
+                             qpw_data[17:16] == 2'd2 ? VADDR_RPSN_ONLY : 48'd0;
             conn_data <= '0;
-            conn_data.local_qpn <= s_axis_qp_tdata[15:0];
-            conn_data.remote_qpn <= s_axis_qp_tdata[32 +: 24];
-            conn_data.remote_ip_address <= {4{bswap32(s_axis_qp_tdata[128 +: 32])}};
-            conn_data.remote_udp_port <= s_axis_qp_tdata[160 +: 16] == 0 ? 16'd4791 : s_axis_qp_tdata[160 +: 16];
+            conn_data.local_qpn <= qpw_data[15:0];
+            conn_data.remote_qpn <= qpw_data[32 +: 24];
+            conn_data.remote_ip_address <= {4{bswap32(qpw_data[128 +: 32])}};
+            conn_data.remote_udp_port <= qpw_data[160 +: 16] == 0 ? 16'd4791 : qpw_data[160 +: 16];
         end
     end
 
     // ------------------------------------------------------------ send queue
-    // a message is split into requests of at most one PMTU
+    // Messages from s_axis_sq and from the register send queue, taken in turn
+    // when both wait; a message is split into requests of at most one PMTU.
     logic        msg_active;
     logic        msg_read;
     logic [5:0]  msg_qpn;
     logic [47:0] msg_laddr, msg_raddr;
     logic [31:0] msg_left;
-    logic        sq_valid, sq_ready;
-    sq_req_t     sq_data;
+    logic        last_reg;                  // the last message came from the registers
 
     wire [31:0] piece = msg_left > PMTU ? PMTU : msg_left;
     wire        piece_last = msg_left <= PMTU;
 
-    assign s_axis_sq_tready = !msg_active;
+    wire          take_reg = rsq_valid && (!s_axis_sq_tvalid || !last_reg);
+    wire          sq_in_valid = s_axis_sq_tvalid || rsq_valid;
+    wire          sq_in_ready = !msg_active;
+    wire [191:0]  sq_in_data = take_reg ? rsq_data : s_axis_sq_tdata;
+
+    assign s_axis_sq_tready = sq_in_ready && !take_reg;
+    assign rsq_ready = sq_in_ready && take_reg;
     assign sq_valid = msg_active;
 
     always_comb begin
@@ -275,13 +297,15 @@ module rdma_stack #(
     always_ff @(posedge aclk) begin
         if (!resetn) begin
             msg_active <= 1'b0;
-        end else if (s_axis_sq_tvalid && s_axis_sq_tready) begin
-            msg_active <= s_axis_sq_tdata[63:32] != 0;
-            msg_read <= s_axis_sq_tdata[0];
-            msg_qpn <= s_axis_sq_tdata[13:8];
-            msg_left <= s_axis_sq_tdata[63:32];
-            msg_laddr <= s_axis_sq_tdata[64 +: 48];
-            msg_raddr <= s_axis_sq_tdata[128 +: 48];
+            last_reg <= 1'b0;
+        end else if (sq_in_valid && sq_in_ready) begin
+            last_reg <= take_reg;
+            msg_active <= sq_in_data[63:32] != 0;
+            msg_read <= sq_in_data[0];
+            msg_qpn <= sq_in_data[13:8];
+            msg_left <= sq_in_data[63:32];
+            msg_laddr <= sq_in_data[64 +: 48];
+            msg_raddr <= sq_in_data[128 +: 48];
         end else if (sq_valid && sq_ready) begin
             msg_active <= !piece_last;
             msg_left <= msg_left - piece;
@@ -368,7 +392,7 @@ module rdma_stack #(
         .m_net_tkeep(tx_tkeep), .m_net_tlast(tx_tlast),
         .s_mac_valid(mac_set), .s_mac_ready(), .s_mac_data(mac_r),
         .s_ip_valid(ip_set), .s_ip_ready(), .s_ip_data(ip_r),
-        .s_arp_valid(s_axis_arp_tvalid), .s_arp_ready(s_axis_arp_tready), .s_arp_data(bswap32(s_axis_arp_tdata)),
+        .s_arp_valid(arp_valid), .s_arp_ready(arp_ready), .s_arp_data(bswap32(arp_data)),
         .s_qp_valid(qp_valid), .s_qp_ready(qp_ready), .s_qp_data(qp_data),
         .s_conn_valid(conn_valid), .s_conn_ready(conn_ready), .s_conn_data(conn_data),
         .s_sq_valid(sq_valid), .s_sq_ready(sq_ready), .s_sq_data(sq_data),
@@ -428,21 +452,14 @@ module rdma_stack #(
     end
 
     // ------------------------------------------------------------ statistics
-    assign stat_rx_frames = stats.rx_pkg_counter;
-    assign stat_tx_frames = stats.tx_pkg_counter;
-    assign stat_arp_rx = stats.arp_rx_pkg_counter;
-    assign stat_arp_tx = stats.arp_tx_pkg_counter;
-    assign stat_icmp_rx = stats.icmp_rx_pkg_counter;
-    assign stat_icmp_tx = stats.icmp_tx_pkg_counter;
-    assign stat_roce_rx = stats.roce_rx_pkg_counter;
-    assign stat_roce_tx = stats.roce_tx_pkg_counter;
-    assign stat_psn_drops = stats.roce_psn_drop_counter;
-    assign stat_retrans = stats.roce_retrans_counter;
-    assign stat_icrc_drops = stats2[0];
-    assign stat_ack_held = stats2[1];
-    assign stat_tx_trimmed = stats2[2];
-    assign stat_stray_cq = stats2[3];
-    assign stat_fcs_drops = fcs_drops;
-    assign stat_rx_overflows = rx_overflows;
-    assign stat_tx_stalled = stats.axis_stream_down;
+    // registers 0x200 + 4 i, in this order (doc/rdma_stack.md)
+    assign stat_words = {
+        rx_overflows, fcs_drops, stats2[3], stats2[2], stats2[1], stats2[0],
+        stats.roce_retrans_counter, stats.roce_psn_drop_counter,
+        stats.roce_tx_pkg_counter, stats.roce_rx_pkg_counter,
+        stats.icmp_tx_pkg_counter, stats.icmp_rx_pkg_counter,
+        stats.arp_tx_pkg_counter, stats.arp_rx_pkg_counter,
+        stats.tx_pkg_counter, stats.rx_pkg_counter
+    };
+    assign tx_stalled = stats.axis_stream_down;
 endmodule
