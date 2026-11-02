@@ -18,7 +18,7 @@ Python 3.
 
 ```
 mkdir build && cd build
-cmake .. -DFPGA_PART=xcv80-lsva4737-2MHP-e-S     # the device the HLS IPs are built for
+cmake .. -DFPGA_PART=<part>                       # the device the HLS IPs are built for
 make rdma_200                                     # and / or make rdma_100
 ```
 
@@ -74,13 +74,13 @@ FIFOs only (no other Xilinx IP).
 One clock, `aclk`, for everything; `aresetn` is synchronous, active low,
 and should be held for at least 16 cycles. At 250 MHz the 1024-bit path
 carries 256 Gb/s and the 512-bit path 128 Gb/s, so each IP keeps up with its
-line rate (the MAC side usually needs a clock domain crossing, e.g. 200G
-DCMAC at 391 MHz with 512 bits, or 100G CMAC at 322 MHz with 512 bits).
+line rate (a MAC running in its own clock needs a clock domain crossing
+in front of the IP).
 
 Simulated payload rates (4 KiB WRITEs, link model at line rate with
 Ethernet framing overhead): see *Verification* below. On hardware the same
-RTL (V80, DCMAC, 1024 bits at 230 MHz) ran WRITEs and READs at 193.5 Gb/s
-and a two-stream data acquisition at 187.4 Gb/s with no loss.
+RTL (1024 bits at 230 MHz on a 200G link) ran WRITEs and READs at
+193.5 Gb/s and a two-stream data acquisition at 187.4 Gb/s with no loss.
 
 ## Interfaces
 
@@ -97,7 +97,7 @@ contiguous from byte 0, only the last beat partial.
   the FCS may not pad.
 - The stack checks no ICRC on received packets: frames with a bad FCS must
   not reach it. Either the MAC drops them, or set `RX_FCS_FILTER = 1` and
-  drive `s_axis_rx_tuser` = bad FCS on the last beat (CMAC / DCMAC style).
+  drive `s_axis_rx_tuser` = bad FCS on the last beat.
   The filter is store and forward with a buffer of
   2^`RX_FCS_FILTER_ADDR_BITS` beats and ignores `tready` (a MAC cannot be
   stalled): `s_axis_rx_tready` is then always 1 and frames that do not fit
@@ -253,7 +253,7 @@ packages them, `rdma_ooc.tcl` checks the result.
 
 ## Transport fixes in `rocev2`
 
-The two-node simulation below found four faults in the transport
+The two-node simulation below found five faults in the transport
 (`hls/ib_transport_protocol/`) that are present in the upstream stack. They
 show up once READs and WRITEs share a link, or once a frame is lost; all are
 fixed here:
@@ -286,6 +286,14 @@ fixed here:
    (`retransRdInit.drop`, `pkgSplit.drop`). A later response or an ACK beyond
    that READ is an implied NAK: everything from the READ on is sent again at
    once instead of after the transport timer.
+5. **Timer stopped with requests outstanding.** RX stopped a QP's transport
+   timer on a response to the last PSN sent. ACKs that overtake the response
+   of a READ before them release nothing (the retransmitter releases in PSN
+   order), so after the READ's response the WRITEs behind it stayed
+   outstanding with no timer to resend them: their completions never came,
+   and once they filled the window the QP stopped. A response now only
+   restarts the timer; it fires once more after the last one and resends
+   whatever the retransmitter still holds (nothing, when all is released).
 
 ## Verification
 
@@ -312,9 +320,9 @@ the headers of a 4 KiB message, preamble and gap included):
 |-----------------------------------------|----------------|----------------|
 | 200 x 4 KiB WRITE                       | 96.3 Gb/s      | 189.0 Gb/s     |
 | 200 x 4 KiB READ                        | 96.0 Gb/s      | 188.3 Gb/s     |
-| 200 random messages, both ways (sum)    | 157.9 Gb/s     | 301.1 Gb/s     |
+| 200 random messages, both ways (sum)    | 148.7 Gb/s     | 287.3 Gb/s     |
 | the same with stalling source and sink  | pass           | pass           |
-| 2 % random frame loss, all of the above | pass, 71 lost  | pass, 90 lost  |
+| 2 % random frame loss, all of the above | pass, 8 seeds, 54 .. 111 lost | pass, 4 seeds, 60 .. 86 lost |
 
 At line rate the 4 KiB WRITEs and READs fill the link: 41.9 cycles per
 message on the wire at 200G, 43.3 measured including start and end.
@@ -331,5 +339,5 @@ excluded):
 
 | IP         | WNS       | LUTs   | FFs    | BRAM tiles | URAM |
 |------------|-----------|--------|--------|------------|------|
-| `rdma_100` | +0.005 ns | 88.5 k | 169 k  | 51         | 30   |
-| `rdma_200` | +0.001 ns | 117 k  | 265 k  | 102        | 30   |
+| `rdma_100` | +0.215 ns | 79.7 k | 164 k  | 51.5       | 30   |
+| `rdma_200` | +0.096 ns | 108 k  | 260 k  | 102.5      | 30   |

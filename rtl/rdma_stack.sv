@@ -317,19 +317,30 @@ module rdma_stack #(
     // ------------------------------------------------------------ completions
     // Per QP, the transport completes WRITEs and READs each in posting order:
     // a FIFO of "last request of the message" flags per QP and kind, 64 deep
-    // (a window of up to 32 plus the request roce_flow holds).
-    logic       ack_valid;
-    ack_t       ack_data;
-    logic       last_flags [2][2**QP_BITS * 64];
-    logic [5:0] lf_head [2][2**QP_BITS];
-    logic [5:0] lf_tail [2][2**QP_BITS];
+    // (a window of up to 32 plus the request roce_flow holds), all in one
+    // distributed RAM at {READ, QPN, slot}. Its write is registered after the
+    // post and its read takes a register stage, both off the window and
+    // completion logic; a completion comes hundreds of cycles after its post.
+    localparam integer LF_BITS = 1 + QP_BITS + 6;
+
+    logic               ack_valid;
+    ack_t               ack_data;
+    (* ram_style = "distributed" *)
+    logic               last_flags [2**LF_BITS];
+    logic [5:0]         lf_head [2][2**QP_BITS];
+    logic [5:0]         lf_tail [2][2**QP_BITS];
+    logic               lf_we, lf_wdata;
+    logic [LF_BITS-1:0] lf_waddr, lf_raddr;
 
     wire        post = sq_valid && sq_ready;
     wire        ack_read = ack_data.opcode != RC_ACK;
 
     always_ff @(posedge aclk) begin
-        if (post)
-            last_flags[msg_read][{msg_qpn, lf_tail[msg_read][msg_qpn]}] <= piece_last;
+        lf_we <= resetn && post;
+        lf_waddr <= {msg_read, msg_qpn, lf_tail[msg_read][msg_qpn]};
+        lf_wdata <= piece_last;
+        if (lf_we)
+            last_flags[lf_waddr] <= lf_wdata;
         if (!resetn) begin
             for (int k = 0; k < 2; k++)
                 for (int q = 0; q < 2**QP_BITS; q++) begin
@@ -344,14 +355,20 @@ module rdma_stack #(
         end
     end
 
+    logic        ack_r, ack_read_r;
+    logic [5:0]  ack_qpn_r;
     logic        cq_valid;
     logic [31:0] cq_data;
     always_ff @(posedge aclk) begin
-        cq_valid <= resetn && ack_valid;
+        ack_r <= resetn && ack_valid;
+        ack_read_r <= ack_read;
+        ack_qpn_r <= ack_data.qpn;
+        lf_raddr <= {ack_read, ack_data.qpn, lf_head[ack_read][ack_data.qpn]};
+        cq_valid <= resetn && ack_r;
         cq_data <= '0;
-        cq_data[0] <= ack_read;
-        cq_data[1] <= last_flags[ack_read][{ack_data.qpn, lf_head[ack_read][ack_data.qpn]}];
-        cq_data[13:8] <= ack_data.qpn;
+        cq_data[0] <= ack_read_r;
+        cq_data[1] <= last_flags[lf_raddr];
+        cq_data[13:8] <= ack_qpn_r;
     end
     assign m_axis_cq_tvalid = cq_valid;
     assign m_axis_cq_tdata = cq_data;

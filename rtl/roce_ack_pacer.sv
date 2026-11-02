@@ -4,7 +4,7 @@
 // GAP_CYCLES apart. The transport's retransmitter needs several cycles per
 // ACK; ACKs back to back overrun it. At 200G a node receives an ACK for
 // every 4 KiB WRITE (about 40 cycles at 230 MHz), so GAP_CYCLES must stay
-// below that (20 measured clean on hardware, Alveo V80).
+// below that (20 measured clean on hardware).
 //
 // A packet is an ACK if its first beat is IPv4 (version 4, IHL 5) / UDP to
 // port 4791 with BTH opcode RC_ACK (0x11). Only first beats are inspected.
