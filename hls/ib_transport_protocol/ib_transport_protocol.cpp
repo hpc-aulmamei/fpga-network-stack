@@ -365,16 +365,15 @@ void rx_ibh_fsm(
 					std::cout << std::hex <<"[RX IBH FSM " << INSTID << "]: retrans update before NAK, psn " << meta.psn << std::endl;
 					rx2retrans_upd.write(retransUpdate(meta.dest_qp, meta.psn - 1, RC_ACK));
 				}
-				// Check if no oustanding requests -> stop timer
+				// Progress: restart the timer. It is not stopped here, even by a
+				// response to the last PSN sent: the retransmitter takes ACKs in
+				// PSN order, so ACKs that overtake a READ response release nothing
+				// and the requests behind the READ stay outstanding. A timer
+				// left running fires once more and resends what is still held
+				// (nothing, when all is released).
 				if (isResponse && meta.op_code != RC_RDMA_READ_RESP_MIDDLE && (!readResp || inOrder))
 				{
-					rxClearTimer_req.write(rxTimerUpdate(meta.dest_qp, meta.psn == qpState.max_forward));
-#ifndef __SYNTHESIS__
-					if (meta.psn  == qpState.max_forward)
-					{
-						std::cout << std::hex << "[RX IBH FSM " << INSTID << "]: clearing transport timer at psn " << meta.psn << std::endl;
-					}
-#endif
+					rxClearTimer_req.write(rxTimerUpdate(meta.dest_qp, false));
 				}
 
                 #ifdef DBG_IBV
