@@ -331,6 +331,10 @@ struct pkgInfo
 		:type(t), words(words) {}
 };
 
+// What a retransEvent is: a packet to send again, or one of the two control
+// events around a NAK replay for local_req_handler (see process_retransmissions)
+enum retransCtrl {RT_PACKET = 0, RT_FENCE = 1, RT_RELEASE = 2};
+
 struct retransEvent
 {
 	ibOpCode 	op_code;
@@ -343,10 +347,13 @@ struct retransEvent
     ap_uint<6>  offs;
 	bool		validPsn;  //TODO remove?
 	bool		isNak; //TODO remove?
+	ap_uint<2>	ctrl;
 	retransEvent()
-		:op_code(RC_ACK), validPsn(false), isNak(false) {}
+		:op_code(RC_ACK), validPsn(false), isNak(false), ctrl(RT_PACKET) {}
 	retransEvent(ibOpCode op, ap_uint<24> qp, ap_uint<64> laddr, ap_uint<64> raddr, ap_uint<32> len, ap_uint<24> psn, ap_uint<1> lst, ap_uint<6> offs)
-		:op_code(op), qpn(qp), localAddr(laddr), remoteAddr(raddr),length(len), psn(psn), lst(lst), offs(offs), validPsn(true), isNak(false) {}
+		:op_code(op), qpn(qp), localAddr(laddr), remoteAddr(raddr),length(len), psn(psn), lst(lst), offs(offs), validPsn(true), isNak(false), ctrl(RT_PACKET) {}
+	retransEvent(retransCtrl c)
+		:op_code(RC_ACK), qpn(0), localAddr(0), remoteAddr(0), length(0), psn(0), lst(0), offs(0), validPsn(false), isNak(false), ctrl(c) {}
 };
 
 struct memMeta

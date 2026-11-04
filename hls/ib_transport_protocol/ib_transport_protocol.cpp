@@ -1140,6 +1140,9 @@ void local_req_handler(
 	event ev;
 	retransEvent rev;
     static ap_uint<32> retransCount = 0;
+	// between a replay's fence and its release no new request is issued (see
+	// process_retransmissions)
+	static bool hold = false;
 
 	//switch (lrh_state)
 	//{
@@ -1148,23 +1151,37 @@ void local_req_handler(
 	if (!retransEventFifo.empty())
 	{
 		retransEventFifo.read(rev);
-		tx_localTxMeta.write(event(rev.op_code, rev.qpn, rev.remoteAddr, rev.length, rev.psn));
-
-        retransCount++;
-        regRetransCount = retransCount;        
-
-		std::cout << std::dec << "[LOCAL REQ HANDLER " << INSTID << "]: retransmission: length: " << rev.length << ", local addr: " << std::hex << rev.localAddr << ", remote addres: " << rev.remoteAddr << ", psn: " << rev.psn << ", op code: " << rev.op_code << ", qpn: " << rev.qpn << std::endl;
-		if (rev.op_code != RC_RDMA_READ_REQUEST)
+		if (rev.ctrl == RT_FENCE)
 		{
-			std::cout << "[LOCAL REQ HANDLER " << INSTID << "]: retranmission writing into memCmd with lengh " << rev.length << std::endl;
-			tx_local_memCmdFifo.write(memCmdInternal(rev.op_code, rev.qpn, rev.localAddr, rev.length, PKG_INT, PKG_R, rev.offs));
-		} 
+			// behind the last request issued
+			hold = true;
+			tx2retrans_insertAddrLen.write(retransAddrLen(true));
+			std::cout << "[LOCAL REQ HANDLER " << INSTID << "]: fence, holding new requests" << std::endl;
+		}
+		else if (rev.ctrl == RT_RELEASE)
+		{
+			hold = false;
+			std::cout << "[LOCAL REQ HANDLER " << INSTID << "]: release" << std::endl;
+		}
+		else
+		{
+			tx_localTxMeta.write(event(rev.op_code, rev.qpn, rev.remoteAddr, rev.length, rev.psn));
 
+			retransCount++;
+			regRetransCount = retransCount;
+
+			std::cout << std::dec << "[LOCAL REQ HANDLER " << INSTID << "]: retransmission: length: " << rev.length << ", local addr: " << std::hex << rev.localAddr << ", remote addres: " << rev.remoteAddr << ", psn: " << rev.psn << ", op code: " << rev.op_code << ", qpn: " << rev.qpn << std::endl;
+			if (rev.op_code != RC_RDMA_READ_REQUEST)
+			{
+				std::cout << "[LOCAL REQ HANDLER " << INSTID << "]: retranmission writing into memCmd with lengh " << rev.length << std::endl;
+				tx_local_memCmdFifo.write(memCmdInternal(rev.op_code, rev.qpn, rev.localAddr, rev.length, PKG_INT, PKG_R, rev.offs));
+			}
+		}
 	}
 	// A new request only when its retransmitter entry fits: the retransmitter
 	// takes no inserts while it replays a QP, and blocking here would stop
 	// the replay it waits for
-	else if (!s_axis_sq_meta.empty() && !tx2retrans_insertAddrLen.full())
+	else if (!hold && !s_axis_sq_meta.empty() && !tx2retrans_insertAddrLen.full())
 #else
 
 	if (!s_axis_sq_meta.empty())
@@ -2277,22 +2294,41 @@ void three_merger(
 	}
 }
 
+// A request's AddrLen entry (local_req_handler) and its Meta entry
+// (generate_ibh, with the PSN) make its retransmitter entry. A fence among the
+// AddrLen entries has no Meta: it goes to the retransmitter once every request
+// before it has its entry.
 void merge_retrans_request(	
 	stream<retransMeta>&		tx2retrans_insertMeta,
 	stream<retransAddrLen>&		tx2retrans_insertAddrLen,
-	stream<retransEntry>&		tx2retrans_insertRequest
+	stream<retransEntry>&		tx2retrans_insertRequest,
+	stream<ap_uint<1> >&		tx2retrans_fence
 ) {
 #pragma HLS inline off
 #pragma HLS pipeline II=1
 
+	static bool alValid = false;
+	static retransAddrLen addrlen;
 	retransMeta meta;
-	retransAddrLen addrlen;
 
-	if (!tx2retrans_insertMeta.empty() && !tx2retrans_insertAddrLen.empty())
+	if (!alValid && !tx2retrans_insertAddrLen.empty())
 	{
-		tx2retrans_insertMeta.read(meta);
 		tx2retrans_insertAddrLen.read(addrlen);
-		tx2retrans_insertRequest.write(retransEntry(meta, addrlen));
+		alValid = true;
+	}
+	if (alValid)
+	{
+		if (addrlen.fence)
+		{
+			tx2retrans_fence.write(1);
+			alValid = false;
+		}
+		else if (!tx2retrans_insertMeta.empty())
+		{
+			tx2retrans_insertMeta.read(meta);
+			tx2retrans_insertRequest.write(retransEntry(meta, addrlen));
+			alValid = false;
+		}
 	}
 }
 
@@ -2585,6 +2621,7 @@ void ib_transport_protocol(
 	static stream<retransMeta> tx2retrans_insertMeta("tx2retrans_insertMeta");
 	static stream<retransAddrLen> tx2retrans_insertAddrLen("tx2retrans_insertAddrLen");
 	static stream<retransEntry>	tx2retrans_insertRequest("tx2retrans_insertRequest");
+	static stream<ap_uint<1> > tx2retrans_fence("tx2retrans_fence");
 	static stream<retransEvent> retransmitter2exh_eventFifo("retransmitter2exh_eventFifo");
 	static stream<ackMeta> rx_exhAckMetaFifo("rx_exhAckMetaFifo");
 	static stream<ackMeta> retrans2ack_meta("retrans2ack_meta");
@@ -2600,6 +2637,7 @@ void ib_transport_protocol(
 	#pragma HLS STREAM depth=8 variable=tx2retrans_insertMeta
 	#pragma HLS STREAM depth=8 variable=tx2retrans_insertAddrLen
 	#pragma HLS STREAM depth=2 variable=tx2retrans_insertRequest
+	#pragma HLS STREAM depth=2 variable=tx2retrans_fence
 	#pragma HLS STREAM depth=8 variable=retransmitter2exh_eventFifo
 	#pragma HLS STREAM depth=4 variable=rx_exhAckMetaFifo
 	#pragma HLS STREAM depth=4 variable=retrans2ack_meta
@@ -2884,7 +2922,7 @@ void ib_transport_protocol(
     */
 
 #ifdef RETRANS_EN
-	merge_retrans_request(tx2retrans_insertMeta, tx2retrans_insertAddrLen, tx2retrans_insertRequest);
+	merge_retrans_request(tx2retrans_insertMeta, tx2retrans_insertAddrLen, tx2retrans_insertRequest, tx2retrans_fence);
 
 	transport_timer<INSTID>(
 		rxClearTimer_req,
@@ -2898,6 +2936,7 @@ void ib_transport_protocol(
 		rx2retrans_req,
 		timer2retrans_req,
 		tx2retrans_insertRequest,
+		tx2retrans_fence,
 		retransmitter2exh_eventFifo,
 		retrans2ack_meta
 	);

@@ -91,9 +91,13 @@ struct retransAddrLen
     ap_uint<1>  lst;
     ap_uint<6>  offs;
     ap_uint<1>  host;
-	retransAddrLen() {}
+	bool        fence;  // no request: the requests before it have all been issued
+	retransAddrLen()
+		:fence(false) {}
 	retransAddrLen(ap_uint<64> laddr, ap_uint<64> raddr, ap_uint<32> len, ap_uint<1> lst, ap_uint<6> offs, ap_uint<1> host)
-		:localAddr(laddr), remoteAddr(raddr), length(len), lst(lst), offs(offs), host(host) {}
+		:localAddr(laddr), remoteAddr(raddr), length(len), lst(lst), offs(offs), host(host), fence(false) {}
+	retransAddrLen(bool f)
+		:localAddr(0), remoteAddr(0), length(0), lst(0), offs(0), host(0), fence(f) {}
 };
 
 struct retransEntry
@@ -304,6 +308,7 @@ void process_retransmissions(
 	stream<retransmission>&         rx2retrans_req,
 	stream<retransmission>&         timer2retrans_req,
 	stream<retransEntry>&	        tx2retrans_insertRequest,
+	stream<ap_uint<1> >&	        tx2retrans_fence,
 	stream<pointerReq>&				pointerReqFifo,
 	stream<pointerUpdate>&			pointerUpdFifo,
 	stream<retransPointerEntry>& 	pointerRspFifo, //TODO reorder
@@ -338,25 +343,48 @@ void process_retransmissions(
 	// the far end's RX is ready, both ends would wait for each other)
 	static bool replaying = false;
 	static retransMetaEntry replayMeta;
+	// A NAK means the responder dropped everything from its PSN on, so the
+	// replay has to send every request issued so far. Those still on their
+	// way through TX are not in the table yet, so the replay does not start at
+	// once: a fence goes to local_req_handler, which stops issuing requests and
+	// passes it on behind the last one issued. The fence comes back here after
+	// that request's entry (fencePending until then); the replay of the NAK
+	// then finds every request issued and, once it is done, a release lets
+	// local_req_handler go on (fenced until then).
+	static bool fencePending = false;
+	static bool fenced = false;
+	static bool fenceSent = false;
 
 	switch (rt_state)
 	{
 	case MAIN:
-		if (!rx2retrans_upd.empty())
+		if (fencePending && !fenceSent && !retrans2event.full())
+		{
+			// the fence for a NAK just taken
+			retrans2event.write(retransEvent(RT_FENCE));
+			fenceSent = true;
+		}
+		else if (fenced && !retrans2event.full())
+		{
+			// the replay of the NAK is done
+			retrans2event.write(retransEvent(RT_RELEASE));
+			fenced = false;
+		}
+		else if (!rx2retrans_upd.empty())
 		{
 			rx2retrans_upd.read(update);
 			pointerReqFifo.write(pointerReq(update.qpn, true)); // enquire whether we have previous req for this qpn
 			rt_state = UPDATE_0;
 			std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: updating " << update.latest_acked_req << std::endl;
 		}
-		else if (!rx2retrans_req.empty())
+		else if (!fencePending && !fenced && !rx2retrans_req.empty())
 		{
 			rx2retrans_req.read(retrans);
-			std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: RX Retransmit triggered!!" << std::endl;
-			pointerReqFifo.write(pointerReq(retrans.qpn)); 		// enquire whether we have previous req for this qpn
-			rt_state = RETRANS_0;
+			std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: RX Retransmit triggered!! fence first" << std::endl;
+			fencePending = true;
+			fenceSent = false;
 		}
-		else if (!timer2retrans_req.empty())
+		else if (!fencePending && !fenced && !timer2retrans_req.empty())
 		{
 			std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: TIMER Retransmit triggered!!" << std::endl;
 			timer2retrans_req.read(retrans);
@@ -371,6 +399,16 @@ void process_retransmissions(
 			pointerReqFifo.write(pointerReq(insert.qpn, true));	// enquire whether we have previous req for this qpn
 			rt_state = INSERT_0;
 			std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: inserting new meta, psn " << std::hex << insert.psn << ", occupying pointer " << newMetaIdx << std::endl;
+		}
+		else if (fenceSent && !tx2retrans_fence.empty() && tx2retrans_insertRequest.empty())
+		{
+			// every request issued before the fence is in the table: replay the NAK
+			tx2retrans_fence.read();
+			fencePending = false;
+			fenced = true;
+			std::cout << "[PROCESS RETRANSMISSION " << INSTID << "]: fence back, retransmitting qpn " << retrans.qpn << ", psn " << retrans.psn << std::endl;
+			pointerReqFifo.write(pointerReq(retrans.qpn)); 		// enquire whether we have previous req for this qpn
+			rt_state = RETRANS_0;
 		}
 		break;
 	case INSERT_0:
@@ -529,7 +567,7 @@ void process_retransmissions(
 					rt_state = replaying ? REPLAY : MAIN;
 
 					// (not while another replay waits: the timer covers that case)
-					if (!replaying && isRead && psn_before(meta.psn, releaseBefore) &&
+					if (!replaying && !fencePending && !fenced && isRead && psn_before(meta.psn, releaseBefore) &&
 						!(impliedValid && impliedQpn == update.qpn && impliedPsn == meta.psn))
 					{
 						std::cout << std::hex << "[PROCESS RETRANSMISSION " << INSTID << "]: implied NAK, retransmitting from read psn " << meta.psn << std::endl;
@@ -677,6 +715,7 @@ void retransmitter(
 	stream<retransmission>& rx2retrans_req,
 	stream<retransmission>& timer2retrans_req,
 	stream<retransEntry>&	tx2retrans_insertRequest,
+	stream<ap_uint<1> >&	tx2retrans_fence,
 	stream<retransEvent>&	retrans2event,
 	stream<ackMeta>&		retrans2ack_meta
 ) {
@@ -714,6 +753,7 @@ void retransmitter(
 		rx2retrans_req,
 		timer2retrans_req,
 		tx2retrans_insertRequest,
+		tx2retrans_fence,
 		rt_pointerReqFifo,
 		rt_pointerUpdFifo,
 		rt_pointerRspFifo,
